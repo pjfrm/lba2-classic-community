@@ -1,0 +1,37 @@
+# One-off helper for a fork. It applies tap-to-walk.patch (committed in the repository root) on top of
+# main, pushes the result to a branch called tap-to-walk, and starts the project's own "Release Android"
+# workflow on that branch. Run it once from the Actions tab; the APKs come out of the "Release Android"
+# run it starts, under Artifacts.
+name: Apply tap to walk and build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the tap-to-walk branch
+  actions: write # start "Release Android" on it
+
+jobs:
+  apply-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out main with its history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply the patch on a new branch
+        run: |
+          set -euo pipefail
+          test -f tap-to-walk.patch || { echo "tap-to-walk.patch is not in the repository root"; exit 1; }
+          git config user.name "tap-to-walk"
+          git config user.email "tap-to-walk@users.noreply.github.com"
+          git checkout -b tap-to-walk
+          git am --3way tap-to-walk.patch
+          git push --force origin tap-to-walk
+
+      - name: Start Release Android on that branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-android.yml --ref tap-to-walk

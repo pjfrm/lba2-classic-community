@@ -1,0 +1,2157 @@
+From 0ae597c0ee2dcab49df42bd2a2c1ca455549b762 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 04:21:41 +0000
+Subject: [PATCH] feat(android): tap to walk, with routes round obstacles
+
+Touching the empty part of the screen now walks Twinsen to that spot;
+keeping the finger down makes him follow it. The tank-style on-screen
+D-pad steps aside while the game is running (it returns on menus, which
+are driven by direction keys) and a ring marks the destination.
+
+It does not move the hero: each gameplay frame TapMove_Steer ORs the
+up/left/right bits into Input, next to the replay harness's, so the
+engine's own manual movement does the rest. The touch becomes a spot on
+the floor by inverting the live camera through the same
+LongWorldRotatePoint/LongProjectPoint pair every actor label uses, so it
+holds for the isometric rooms and the perspective Auto camera alike.
+Interiors route round obstacles with A* on the brick grid; islands walk
+straight at the spot.
+
+New: SOURCES/TAPMOVE.{H,CPP} (game side), TAPMOVE_MATH.CPP (projection
+inversion and steering), TAPMOVE_PATH.CPP (route finder), tests/tapmove,
+the TouchTapToMove setting (touch_tap_move) and a docs/ANDROID.md
+section. tests/platform stubs the four calls the overlay now makes.
+---
+ SOURCES/CMakeLists.txt                    |   1 +
+ SOURCES/CONFIG_FILE.CPP                   |   8 +-
+ SOURCES/PERSO.CPP                         |   6 +
+ SOURCES/TAPMOVE.CPP                       | 472 ++++++++++++++++++++++
+ SOURCES/TAPMOVE.H                         | 160 ++++++++
+ SOURCES/TAPMOVE_MATH.CPP                  | 166 ++++++++
+ SOURCES/TAPMOVE_PATH.CPP                  | 259 ++++++++++++
+ SOURCES/TOUCH_INPUT.CPP                   |  98 ++++-
+ docs/ANDROID.md                           |  47 ++-
+ tests/CMakeLists.txt                      |   1 +
+ tests/platform/test_platform_contract.cpp |  14 +
+ tests/tapmove/CMakeLists.txt              |  40 ++
+ tests/tapmove/test_tapmove_math.cpp       | 257 ++++++++++++
+ tests/tapmove/test_tapmove_path.cpp       | 349 ++++++++++++++++
+ 14 files changed, 1872 insertions(+), 6 deletions(-)
+ create mode 100644 SOURCES/TAPMOVE.CPP
+ create mode 100644 SOURCES/TAPMOVE.H
+ create mode 100644 SOURCES/TAPMOVE_MATH.CPP
+ create mode 100644 SOURCES/TAPMOVE_PATH.CPP
+ create mode 100644 tests/tapmove/CMakeLists.txt
+ create mode 100644 tests/tapmove/test_tapmove_math.cpp
+ create mode 100644 tests/tapmove/test_tapmove_path.cpp
+
+diff --git a/SOURCES/CMakeLists.txt b/SOURCES/CMakeLists.txt
+index aa126c9..ef3e058 100644
+--- a/SOURCES/CMakeLists.txt
++++ b/SOURCES/CMakeLists.txt
+@@ -36,6 +36,7 @@ set(SOURCES_FILES_ASM_DOS DEC_XCF.ASM HERCUL_A.ASM KEYB.ASM)
+ 
+ list(APPEND SOURCES_FILES CONSOLE/CONSOLE_CMD.CPP)
+ list(APPEND SOURCES_FILES ASSET_PREFLIGHT.CPP)
++list(APPEND SOURCES_FILES TAPMOVE.CPP TAPMOVE_MATH.CPP TAPMOVE_PATH.CPP)
+ if(WIN32)
+     list(APPEND SOURCES_FILES_WIN ${CMAKE_BINARY_DIR}/packaging/lba2cc.rc)
+ endif()
+diff --git a/SOURCES/CONFIG_FILE.CPP b/SOURCES/CONFIG_FILE.CPP
+index 0c32c4c..d6d341b 100644
+--- a/SOURCES/CONFIG_FILE.CPP
++++ b/SOURCES/CONFIG_FILE.CPP
+@@ -14,6 +14,7 @@
+ #include "MOUSE_CAPTURE.H"   /* MouseConfine */
+ #include "RES_SWITCH.H"
+ #include "RETAILFIX.H"         /* the retail fixes' settings */
++#include "TAPMOVE.H"           /* TouchTapToMove */
+ #include <PLATFORM/PLATFORM.H> /* PLATFORM_FILTER_*, and why a mode was refused */
+ #include <POLYGON/POLYFILT.H>  /* PolyTexFilter / EnvTexFilter */
+ #include <SVGA/SCREEN.H>
+@@ -206,8 +207,9 @@ static const T_SETTING MouseSettings[] = {
+ };
+ #define MOUSE_SETTING_COUNT ((S32)(sizeof(MouseSettings) / sizeof(MouseSettings[0])))
+ 
+-/* The right stick's camera preferences and the stick deadzone. The pad's
+- * bindings stay with INPUT.CPP, which writes them straight after these. The
++/* The right stick's camera preferences and the stick deadzone, and the touch
++ * overlay's tap-to-walk switch, which is too small to have a table of its own.
++ * The pad's bindings stay with INPUT.CPP, which writes them straight after these. The
+  * deadzone's ceiling is load-bearing too: JOYSTICK.CPP narrows it to S16. */
+ static const T_SETTING GamepadSettings[] = {
+     {"GamepadDeadzone", NULL, "pad_deadzone", &JoystickDeadzone, SETTING_CLAMP, 8000, 0, 32767,
+@@ -224,6 +226,8 @@ static const T_SETTING GamepadSettings[] = {
+      1, 200, NULL, NULL, NULL, NULL, "Right-stick orbit speed ceiling (units/frame at sens 10)", SETTING_RECORDED, SETTING_BEFORE_NONE},
+     {"GamepadCamMaxAlpha", NULL, "cam_stick_max_y", &GamepadCamMaxAlpha, SETTING_CLAMP, GAMEPAD_CAM_ALPHA_MAX_DEFAULT,
+      1, 100, NULL, NULL, NULL, NULL, "Right-stick elevation speed ceiling (units/frame at sens 10)", SETTING_RECORDED, SETTING_BEFORE_NONE},
++    {"TouchTapToMove", NULL, "touch_tap_move", &TouchTapToMove, SETTING_TRUTHY, TRUE, 0, 1,
++     NULL, NULL, NULL, NULL, "Touch overlay: tap the screen to walk there (0 = on-screen D-pad)", SETTING_NOT_RECORDED},
+ };
+ #define GAMEPAD_SETTING_COUNT ((S32)(sizeof(GamepadSettings) / sizeof(GamepadSettings[0])))
+ 
+diff --git a/SOURCES/PERSO.CPP b/SOURCES/PERSO.CPP
+index 78957f6..7effbdc 100644
+--- a/SOURCES/PERSO.CPP
++++ b/SOURCES/PERSO.CPP
+@@ -24,6 +24,7 @@ extern S32 GfxDitherShading;
+ #include "EXIT_SCREEN.H"
+ #include "PERFTRACE.H"
+ #include "TOUCH_INPUT.H"
++#include "TAPMOVE.H"
+ #include <SYSTEM/CUE.H>
+ #include <SYSTEM/DISCIMG.H>
+ #include <SYSTEM/LOG.H>
+@@ -630,6 +631,11 @@ restartloop:
+             Control_InputFrameTick();
+         }
+ 
++        // Touch tap-to-walk: OR in the movement keys that steer the hero to the spot the player
++        // touched (TAPMOVE.H). The only place it runs is this loop, so a dialogue or a menu,
++        // which run their own, never see it.
++        Input |= TapMove_Steer();
++
+         ManageTime();
+ 
+         if (DemoSlide) {
+diff --git a/SOURCES/TAPMOVE.CPP b/SOURCES/TAPMOVE.CPP
+new file mode 100644
+index 0000000..9234466
+--- /dev/null
++++ b/SOURCES/TAPMOVE.CPP
+@@ -0,0 +1,472 @@
++/* Tap-to-walk, the half that touches the game. The design, and the reasons for
++ * it, are in TAPMOVE.H; the pure maths is in TAPMOVE_MATH.CPP. */
++
++#include "TAPMOVE.H"
++
++#include "C_EXTERN.H"
++#include "CONTROL.H"
++#include "GRILLE.H"
++#include "INPUT.H"
++#include "RECORD.H"
++
++#include <3D/GETANG2D.H>
++#include <PLATFORM/PLATFORM.H>
++#include <SVGA/SCREEN.H>
++#include <SYSTEM/TIMER.H>
++
++#include <math.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* How close counts as arrived: a third of a brick. Tight enough that he stops
++ * where the finger was, loose enough that a hero who cannot quite reach the exact
++ * point (a narrow gap, a ledge) is not left walking on the spot. */
++#define TAP_ARRIVE_RADIUS 170
++
++/* A waypoint on the way is passed at this distance: a little over half a brick, so
++ * the hero rounds a corner instead of walking up to its exact centre and then
++ * having to turn on the spot. */
++#define TAP_WAYPOINT_RADIUS 260
++
++/* While a finger is held and drags the destination across the floor, the route is
++ * worked out again when it enters another cell, but no more often than this (game
++ * clock, ms). */
++#define TAP_REPLAN_MS 150
++
++/* The most waypoints one route keeps. A cube is 64 x 64 bricks and smoothing
++ * leaves a handful of corners, so this is a ceiling, not an expectation. */
++#define TAP_MAX_WP 160
++
++/* A tap further than this from the hero is pulled back along the line to it
++ * (about 47 bricks: past anything that is on screen with the camera zoomed out). */
++#define TAP_MAX_DIST 24000
++
++/* No gameplay frame for this long (wall clock) means a modal screen, a pause or a
++ * load was up. The walk is dropped on the way back rather than resumed: the
++ * player's intent was about a scene that has since changed. */
++#define TAP_RESUME_GAP_MS 250
++
++/* Game clock. One order may not walk longer than this, whatever else happens. */
++#define TAP_MAX_WALK_MS 20000
++
++/* Blocked detection, on the game clock: over a window in which the hero spent most
++ * of the time holding forward, he must have covered at least MIN_MOVE units, or
++ * that is a strike. The first strike plans the route again from where he stands (the
++ * grid can be wrong about a door, a pushed block, somebody standing in the way);
++ * a second in a row drops the order. */
++#define TAP_STUCK_WINDOW_MS 450
++#define TAP_STUCK_MIN_MOVE 70
++#define TAP_STUCK_STRIKES 2
++
++typedef struct {
++    S32 active;  /* a destination is set */
++    S32 down;    /* the finger that gave it is still on the glass */
++    S32 fresh;   /* a touch has arrived since the destination was last worked out */
++    S32 restart; /* the next resolve starts a new order: reset the timers */
++
++    float nx, ny; /* the finger, game-normalised */
++
++    S32 tx, ty, tz; /* the tapped spot, world */
++    S32 turn;       /* TapMove_Aim's memory of last frame's turn */
++
++    S32 wpX[TAP_MAX_WP]; /* the route: waypoints, world; the last is the destination */
++    S32 wpZ[TAP_MAX_WP];
++    S32 wpN, wpI;       /* how many, and which one the hero is heading for */
++    S32 planned;        /* wpX/wpZ hold a route for the current destination */
++    S32 replan;         /* plan again at the next opportunity */
++    S32 partial;        /* the route ends short of the tapped spot (it is walled off) */
++    S32 planCx, planCz; /* the destination's cell when the route was planned */
++    U32 planMs;         /* game clock when it was planned */
++
++    U32 startMs;    /* game clock: when this order began */
++    U32 sampleMs;   /* game clock: start of the current blocked-detection window */
++    U32 lastGameMs; /* game clock at the previous TapMove_Steer */
++    S32 sampleX, sampleZ;
++    S32 walkedMs; /* time spent holding forward in this window */
++    S32 strikes;
++
++    U32 lastFrameMs; /* wall clock at the previous TapMove_Steer; 0 = never */
++
++    S32 markerOk;
++    S32 markerX, markerY;
++} T_TAPMOVE;
++
++static T_TAPMOVE s_tap;
++
++S32 TouchTapToMove = 1;
++
++static U32 WallMs(void) {
++    return (U32)g_platform.system.ticks_ms();
++}
++
++/* Gameplay is running if the main loop has asked us for steering recently. Every
++ * modal screen runs its own inner loop and never gets here, so the absence of
++ * calls is the signal -- no per-screen mode stack needed. */
++static S32 GameplayRunning(void) {
++    return s_tap.lastFrameMs != 0 && (U32)(WallMs() - s_tap.lastFrameMs) <= TAP_RESUME_GAP_MS;
++}
++
++S32 TapMove_IsEnabled(void) {
++    return TouchTapToMove ? 1 : 0;
++}
++
++S32 TapMove_ReplacesDpad(void) {
++    return TapMove_IsEnabled() && GameplayRunning();
++}
++
++void TapMove_Cancel(void) {
++    s_tap.active = 0;
++    s_tap.down = 0;
++    s_tap.fresh = 0;
++    s_tap.restart = 0;
++    s_tap.turn = 0;
++    s_tap.strikes = 0;
++    s_tap.walkedMs = 0;
++    s_tap.planned = 0;
++    s_tap.replan = 0;
++    s_tap.wpN = 0;
++    s_tap.wpI = 0;
++    s_tap.markerOk = 0;
++}
++
++S32 TapMove_Touch(float nx, float ny, S32 phase) {
++    if (!TapMove_IsEnabled())
++        return 0;
++
++    switch (phase) {
++    case TAPMOVE_FINGER_DOWN:
++        /* A tap on a dialogue, a menu or a loading screen is not a walk order:
++           queueing it would send the hero off the moment the screen closed. */
++        if (!GameplayRunning())
++            return 0;
++        s_tap.nx = nx;
++        s_tap.ny = ny;
++        s_tap.down = 1;
++        s_tap.fresh = 1;
++        s_tap.restart = 1;
++        return 1;
++
++    case TAPMOVE_FINGER_MOVE:
++        if (!s_tap.down)
++            return 0;
++        s_tap.nx = nx;
++        s_tap.ny = ny;
++        s_tap.fresh = 1;
++        return 1;
++
++    case TAPMOVE_FINGER_UP:
++        if (!s_tap.down)
++            return 0;
++        /* The order stands: a tap is "go there", it does not end with the lift. */
++        s_tap.down = 0;
++        return 1;
++    }
++    return 0;
++}
++
++S32 TapMove_GetMarker(S32 *sx, S32 *sy) {
++    if (!s_tap.active || !s_tap.markerOk)
++        return 0;
++    *sx = s_tap.markerX;
++    *sy = s_tap.markerY;
++    return 1;
++}
++
++/* The finger -> a point on the floor at the hero's feet, through the camera the
++ * frame was drawn with. Returns 0 for a tap that is not on the ground (the sky,
++ * behind the camera). */
++static S32 ResolveFinger(const T_OBJET *hero, S32 *gx, S32 *gz) {
++    if (ModeDesiredX == 0 || ModeDesiredY == 0)
++        return 0;
++
++    const S32 px = (S32)(s_tap.nx * (float)ModeDesiredX + 0.5f);
++    const S32 py = (S32)(s_tap.ny * (float)ModeDesiredY + 0.5f);
++
++    if (!TapMove_SolveGround(px, py, hero->Obj.Y, hero->Obj.X, hero->Obj.Z, gx, gz))
++        return 0;
++
++    const double dx = (double)(*gx - hero->Obj.X);
++    const double dz = (double)(*gz - hero->Obj.Z);
++    const double dist = sqrt(dx * dx + dz * dz);
++    if (dist > (double)TAP_MAX_DIST) {
++        *gx = hero->Obj.X + (S32)(dx * (double)TAP_MAX_DIST / dist);
++        *gz = hero->Obj.Z + (S32)(dz * (double)TAP_MAX_DIST / dist);
++    }
++    return 1;
++}
++
++/* The ring goes where the route ends: the tapped spot, or the nearest the hero can
++ * get to it when that is walled off. */
++static void UpdateMarker(void) {
++    if (s_tap.wpN < 1) {
++        s_tap.markerOk = 0;
++        return;
++    }
++    s_tap.markerOk = TapMove_Project(s_tap.wpX[s_tap.wpN - 1], s_tap.ty, s_tap.wpZ[s_tap.wpN - 1], &s_tap.markerX,
++                                     &s_tap.markerY)
++                         ? 1
++                         : 0;
++}
++
++static S64 DistSq(S32 dx, S32 dz) {
++    return (S64)dx * (S64)dx + (S64)dz * (S64)dz;
++}
++
++/* ---- Routes -------------------------------------------------------------- */
++
++typedef struct {
++    S32 y;    /* the hero's feet: the floor the route is on */
++    S32 ymax; /* his height: what has to be clear above it */
++} T_WALK_CTX;
++
++/* Can the hero stand in this cell of the grid? The same two questions the
++ * engine asks when it moves him: is the column at his height free (a result of
++ * 1 is a solid brick; ramps and stairs are other codes and can be walked), and is
++ * there a brick under his feet to stand on, so a route does not lead off a ledge or
++ * across a hole. */
++static S32 CellWalkable(void *vctx, S32 cx, S32 cz) {
++    const T_WALK_CTX *c = (const T_WALK_CTX *)vctx;
++    const S32 x = cx * SIZE_BRICK_XZ + SIZE_BRICK_XZ / 2;
++    const S32 z = cz * SIZE_BRICK_XZ + SIZE_BRICK_XZ / 2;
++
++    /* The probes leave the cell they looked at in these. */
++    const S32 saveX = XMap, saveY = YMap, saveZ = ZMap;
++
++    S32 ok = (WorldColBrickFull(x, c->y, z, c->ymax) != 1);
++    if (ok && c->y > 0)
++        ok = (WorldColBrick(x, c->y - 1, z) != 0);
++
++    XMap = saveX;
++    YMap = saveY;
++    ZMap = saveZ;
++    return ok;
++}
++
++static S32 ClampCell(S32 v) {
++    return v < 0 ? 0 : (v >= SIZE_CUBE_X ? SIZE_CUBE_X - 1 : v);
++}
++
++/* Fill the route from the hero to the tapped spot, round whatever is in between.
++ * Returns the number of waypoints, or 0 when there is nothing better than walking
++ * straight at it: not an interior (an island is not on the brick grid), the hero
++ * and the spot in one cell, or no usable route. */
++static S32 BuildRoute(const T_OBJET *hero) {
++    if (CubeMode != CUBE_INTERIEUR)
++        return 0;
++
++    const S32 sx = hero->Obj.X >> 9;
++    const S32 sz = hero->Obj.Z >> 9;
++    if (sx < 0 || sx >= SIZE_CUBE_X || sz < 0 || sz >= SIZE_CUBE_Z)
++        return 0;
++
++    const S32 gx = ClampCell(s_tap.tx >> 9);
++    const S32 gz = ClampCell(s_tap.tz >> 9);
++    if (sx == gx && sz == gz)
++        return 0;
++
++    T_WALK_CTX ctx;
++    ctx.y = hero->Obj.Y;
++    ctx.ymax = hero->YMax;
++
++    S16 cx[TAP_MAX_WP], cz[TAP_MAX_WP];
++    S32 reached = 0;
++    TapPath_Begin(CellWalkable, &ctx, SIZE_CUBE_X, SIZE_CUBE_Z);
++    S32 n = TapPath_Find(sx, sz, gx, gz, cx, cz, TAP_MAX_WP, &reached);
++    if (n < 2)
++        return 0;
++    n = TapPath_Smooth(cx, cz, n);
++
++    /* The hero is already in the first cell: the route is the ones after it. */
++    S32 k = 0;
++    for (S32 i = 1; i < n && k < TAP_MAX_WP; i++) {
++        s_tap.wpX[k] = cx[i] * SIZE_BRICK_XZ + SIZE_BRICK_XZ / 2;
++        s_tap.wpZ[k] = cz[i] * SIZE_BRICK_XZ + SIZE_BRICK_XZ / 2;
++        k++;
++    }
++
++    s_tap.partial = reached ? 0 : 1;
++    if (reached && (s_tap.tx >> 9) == gx && (s_tap.tz >> 9) == gz) {
++        /* End on the spot that was touched, not the middle of its cell. */
++        s_tap.wpX[k - 1] = s_tap.tx;
++        s_tap.wpZ[k - 1] = s_tap.tz;
++    }
++    return k;
++}
++
++static void PlanRoute(const T_OBJET *hero, U32 gameNow) {
++    s_tap.partial = 0;
++    S32 n = BuildRoute(hero);
++    if (n == 0) {
++        s_tap.wpX[0] = s_tap.tx;
++        s_tap.wpZ[0] = s_tap.tz;
++        n = 1;
++        s_tap.partial = 0;
++    }
++    s_tap.wpN = n;
++    s_tap.wpI = 0;
++    s_tap.planned = 1;
++    s_tap.replan = 0;
++    s_tap.planCx = s_tap.tx >> 9;
++    s_tap.planCz = s_tap.tz >> 9;
++    s_tap.planMs = gameNow;
++}
++
++U32 TapMove_Steer(void) {
++    const U32 wallNow = WallMs();
++    const S32 resumed = s_tap.lastFrameMs != 0 && (U32)(wallNow - s_tap.lastFrameMs) > TAP_RESUME_GAP_MS;
++    s_tap.lastFrameMs = wallNow;
++
++    const U32 gameNow = TimerRefHR;
++    const S32 frameMs = (S32)(gameNow - s_tap.lastGameMs);
++    s_tap.lastGameMs = gameNow;
++
++    /* Back from a modal screen, a pause or a load. */
++    if (resumed)
++        TapMove_Cancel();
++
++    /* A replay already carries the bits this produced, and the scripted harness
++       drives the hero itself; adding ours would double-drive him. Demo reels are
++       not playable. */
++    if (!TapMove_IsEnabled() || DemoSlide || Control_IsActive() || Record_IsReplaying()) {
++        TapMove_Cancel();
++        return 0;
++    }
++
++    const T_OBJET *hero = &ListObjet[NUM_PERSO];
++
++    /* Only while the player really has the hero: a cutscene or a script moves him
++       on a track, and a dead hero walks nowhere. */
++    if (hero->Move != MOVE_MANUAL || hero->Obj.Body.Num == -1 || hero->LifePoint <= 0) {
++        TapMove_Cancel();
++        return 0;
++    }
++
++    if (!s_tap.active && !s_tap.fresh && !s_tap.down)
++        return 0;
++
++    /* Real movement input (keyboard, pad) always wins over a walk order. Input
++       holds only what was read from real devices so far this frame. */
++    if (Input & I_JOY) {
++        TapMove_Cancel();
++        return 0;
++    }
++
++    /* Work out where the finger is. While it is down this runs every frame, not
++       only when it moves: the camera follows the hero, so a finger that does not
++       move still points at a different piece of floor from one frame to the next. */
++    if (s_tap.fresh || s_tap.down) {
++        S32 gx, gz;
++        s_tap.fresh = 0;
++        if (ResolveFinger(hero, &gx, &gz)) {
++            s_tap.tx = gx;
++            s_tap.tz = gz;
++            s_tap.ty = hero->Obj.Y;
++            if (!s_tap.active || s_tap.restart) {
++                s_tap.active = 1;
++                s_tap.planned = 0; /* a new order: a new route */
++                s_tap.turn = 0;
++                s_tap.strikes = 0;
++                s_tap.walkedMs = 0;
++                s_tap.startMs = gameNow;
++                s_tap.sampleMs = gameNow;
++                s_tap.sampleX = hero->Obj.X;
++                s_tap.sampleZ = hero->Obj.Z;
++            }
++            s_tap.restart = 0;
++        } else if (s_tap.restart) {
++            /* The tap that started this was not on the ground: nothing to walk to. */
++            s_tap.restart = 0;
++            if (!s_tap.active)
++                s_tap.down = 0;
++        }
++    }
++
++    if (!s_tap.active)
++        return 0;
++
++    /* Plan the route to where the finger points, or plan it again: the finger
++       moved to another cell (a held finger drags the destination about), or the
++       hero was found to be blocked. Inside the same cell the last waypoint just
++       follows the finger. */
++    {
++        const S32 moved = (s_tap.tx >> 9) != s_tap.planCx || (s_tap.tz >> 9) != s_tap.planCz;
++        if (!s_tap.planned || s_tap.replan || (moved && (U32)(gameNow - s_tap.planMs) >= (U32)TAP_REPLAN_MS)) {
++            PlanRoute(hero, gameNow);
++        } else if (!s_tap.partial && !moved && s_tap.wpN > 0) {
++            s_tap.wpX[s_tap.wpN - 1] = s_tap.tx;
++            s_tap.wpZ[s_tap.wpN - 1] = s_tap.tz;
++        }
++    }
++
++    /* Pass the waypoints already reached; the last one is the destination. */
++    while (s_tap.wpI < s_tap.wpN - 1 &&
++           DistSq(s_tap.wpX[s_tap.wpI] - hero->Obj.X, s_tap.wpZ[s_tap.wpI] - hero->Obj.Z) <=
++               (S64)TAP_WAYPOINT_RADIUS * (S64)TAP_WAYPOINT_RADIUS)
++        s_tap.wpI++;
++
++    const S32 aimX = s_tap.wpX[s_tap.wpI];
++    const S32 aimZ = s_tap.wpZ[s_tap.wpI];
++    const S32 isLast = (s_tap.wpI == s_tap.wpN - 1);
++
++    UpdateMarker();
++
++    const S32 arrived =
++        isLast && DistSq(aimX - hero->Obj.X, aimZ - hero->Obj.Z) <= (S64)TAP_ARRIVE_RADIUS * (S64)TAP_ARRIVE_RADIUS;
++
++    /* A held finger keeps the order alive (the hero waits where it points); a
++       lifted one ends it on arrival or when it has been going on too long. */
++    if (!s_tap.down) {
++        if (arrived || (U32)(gameNow - s_tap.startMs) > (U32)TAP_MAX_WALK_MS) {
++            TapMove_Cancel();
++            return 0;
++        }
++    }
++    if (arrived) {
++        s_tap.turn = 0;
++        return 0;
++    }
++
++    /* Blocked? */
++    if ((U32)(gameNow - s_tap.sampleMs) >= (U32)TAP_STUCK_WINDOW_MS) {
++        const S32 mx = hero->Obj.X - s_tap.sampleX;
++        const S32 mz = hero->Obj.Z - s_tap.sampleZ;
++        const S32 spentWalking = s_tap.walkedMs * 4 >= TAP_STUCK_WINDOW_MS * 3;
++        if (spentWalking && DistSq(mx, mz) < (S64)TAP_STUCK_MIN_MOVE * (S64)TAP_STUCK_MIN_MOVE)
++            s_tap.strikes++;
++        else
++            s_tap.strikes = 0;
++        s_tap.sampleMs = gameNow;
++        s_tap.sampleX = hero->Obj.X;
++        s_tap.sampleZ = hero->Obj.Z;
++        s_tap.walkedMs = 0;
++        if (s_tap.strikes >= TAP_STUCK_STRIKES) {
++            TapMove_Cancel();
++            return 0;
++        }
++        if (s_tap.strikes > 0)
++            s_tap.replan = 1; /* the first strike: look for another way from here */
++    }
++
++    const S32 bearing = GetAngle2D(hero->Obj.X, hero->Obj.Z, aimX, aimZ);
++    const T_TAP_STEER st = TapMove_Aim(hero->Obj.Beta & 4095, bearing, s_tap.turn);
++    s_tap.turn = st.turn;
++
++    U32 bits = 0;
++    if (st.turn > 0)
++        bits |= I_LEFT; /* the heading grows while I_LEFT is held (ManualRealAngle) */
++    else if (st.turn < 0)
++        bits |= I_RIGHT;
++    if (st.forward) {
++        bits |= I_UP;
++        /* A hitch in the frame clock must not count as a long walk. */
++        if (frameMs > 0 && frameMs < 100)
++            s_tap.walkedMs += frameMs;
++    }
++    return bits;
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/SOURCES/TAPMOVE.H b/SOURCES/TAPMOVE.H
+new file mode 100644
+index 0000000..49475d8
+--- /dev/null
++++ b/SOURCES/TAPMOVE.H
+@@ -0,0 +1,160 @@
++#pragma once
++
++#include <SYSTEM/ADELINE_TYPES.H>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Tap-to-walk for the touch overlay.
++ *
++ * Touch the empty part of the screen and Twinsen walks to that spot; keep the
++ * finger down and he follows it. The D-pad this replaces made the player steer
++ * a tank (turn, then walk) with two thumbs on a glass screen, which is the part
++ * of the 1997 controls that suits a touchscreen least.
++ *
++ * HOW IT WORKS
++ * ------------
++ * It does not move the hero. It presses the same keys a player would: each
++ * gameplay frame TapMove_Steer returns I_UP / I_LEFT / I_RIGHT bits that are ORed
++ * into Input, right where the replay harness already ORs its own. Everything
++ * after that -- animations, speed, collisions, climbing, swimming, the
++ * behaviour modes -- is the engine's existing manual-movement code, untouched.
++ *
++ * A tap becomes a spot on the ground by inverting the live camera: the engine's
++ * own world->screen projection (LongWorldRotatePoint + LongProjectPoint, the
++ * pair every actor label and shadow goes through) is solved for the point on the
++ * floor, at the hero's feet height, that lands under the finger. Doing it through
++ * the projection the game is drawing with, rather than re-deriving the camera,
++ * is what makes it right for the classic isometric rooms and the perspective
++ * Auto camera alike.
++ *
++ * The steering itself (TapMove_Aim) is a pure function of the hero's heading and
++ * the bearing to the spot, with hysteresis so a held turn key is not toggled every
++ * frame -- the manual-movement code restarts the walk animation whenever the
++ * movement bits change.
++ *
++ * WHAT STOPS IT
++ * -------------
++ * Arrival; a new tap; any real movement input (pad, keyboard); the hero leaving
++ * manual control (cutscene, script, death); a modal screen (dialogue, menu,
++ * inventory: they run their own loops, so TapMove_Steer simply stops being
++ * called and the walk is dropped when it resumes); being blocked for about a
++ * second; and a ceiling on how long one walk may last.
++ *
++ * It is off during replays and the scripted harness: a recording already holds the
++ * bits this produced, and generating them again would double-drive the hero.
++ *
++ * Setting: TouchTapToMove in lba2.cfg / touch_tap_move on the console (default on;
++ * 0 brings the on-screen D-pad back).
++ */
++
++/* ---------------------------------------------------------------------------
++ * Pure helpers (TAPMOVE_MATH.CPP). No game state beyond the camera globals the
++ * projection already reads, so they are unit tested on their own.
++ * --------------------------------------------------------------------------- */
++
++/* Steering decision for one frame. */
++typedef struct {
++    S32 turn;    /* +1: heading must grow (hold I_LEFT), -1: shrink (I_RIGHT), 0: hold */
++    S32 forward; /* 1: hold I_UP */
++} T_TAP_STEER;
++
++/* Signed shortest angle from `beta` to `bearing`, in 1/4096 turn units, in
++ * [-2048, 2047]. Positive means the heading has to grow. */
++S32 TapMove_AngleError(S32 beta, S32 bearing);
++
++/* One frame of steering. `prevTurn` is last frame's `turn`: it is the memory the
++ * hysteresis needs to keep a turn going until the heading is nearly right instead
++ * of releasing it the moment the error dips under the threshold that started it. */
++T_TAP_STEER TapMove_Aim(S32 beta, S32 bearing, S32 prevTurn);
++
++/* World point -> screen pixel with the camera and projection the game is drawing
++ * with, leaving the projection's scratch globals (X0, Y0, Z0, Xp, Yp) as they
++ * were. Returns 0 when the point is not on screen (behind the camera). */
++S32 TapMove_Project(S32 x, S32 y, S32 z, S32 *sx, S32 *sy);
++
++/* The point on the horizontal plane y = groundY that the live camera projects to
++ * the screen pixel (px, py), in the same logical pixels the projection uses.
++ * (startX, startZ) seeds the search; the hero's own position is the natural seed.
++ * Returns 1 and fills *outX / *outZ, or 0 when there is no such point on screen
++ * (above the horizon, behind the camera) or the answer does not hold up when
++ * projected back. */
++S32 TapMove_SolveGround(S32 px, S32 py, S32 groundY, S32 startX, S32 startZ, S32 *outX, S32 *outZ);
++
++/* ---------------------------------------------------------------------------
++ * Route finding (TAPMOVE_PATH.CPP): A* on the cell grid of an interior cube, so a
++ * tap on the far side of a wall walks round it instead of into it. Pure: the
++ * caller says which cells can be stood on.
++ *
++ * A query is TapPath_Begin, then TapPath_Find, then (optionally) TapPath_Smooth,
++ * which reuses what Find learned about the grid.
++ * --------------------------------------------------------------------------- */
++
++/* The largest grid it will search: an interior cube is 64 x 64 bricks. */
++#define TAPPATH_GRID_MAX 64
++
++/* Can a hero stand in cell (cx, cz)? */
++typedef S32 (*T_TAP_WALKABLE)(void *ctx, S32 cx, S32 cz);
++
++void TapPath_Begin(T_TAP_WALKABLE walkable, void *ctx, S32 gridW, S32 gridH);
++
++/* The cheapest route from (sx, sz) to (gx, gz) over 8-connected cells, no corner
++ * cutting, written start first into outX / outZ (room for maxOut cells). Returns
++ * the number of cells, 0 if the query is unusable. *reachedGoal is 1 if the last
++ * cell is the goal. If the goal cannot be reached (it is a wall, or walled in)
++ * the route ends at the reachable cell nearest to it: walk as close as you can.
++ * The start cell is always taken as walkable. */
++S32 TapPath_Find(S32 sx, S32 sz, S32 gx, S32 gz, S16 *outX, S16 *outZ, S32 maxOut, S32 *reachedGoal);
++
++/* Whether a straight run between two cells stays on walkable ones (and cuts no
++ * corner). */
++S32 TapPath_LineClear(S32 ax, S32 az, S32 bx, S32 bz);
++
++/* Drops the cells of a route that a straight line can skip, in place, keeping
++ * both ends. Returns the new count. */
++S32 TapPath_Smooth(S16 *x, S16 *z, S32 n);
++
++/* ---------------------------------------------------------------------------
++ * Game side (TAPMOVE.CPP)
++ * --------------------------------------------------------------------------- */
++
++#define TAPMOVE_FINGER_DOWN 0
++#define TAPMOVE_FINGER_MOVE 1
++#define TAPMOVE_FINGER_UP 2
++
++/* The TouchTapToMove setting (lba2.cfg key, touch_tap_move on the console): 1 = a
++ * touch on empty glass walks there, 0 = the on-screen D-pad, as before. Defined in
++ * TAPMOVE.CPP with the rest of the module's state; CONFIG_FILE.CPP lists it. */
++extern S32 TouchTapToMove;
++
++/* Whether the player has tap-to-walk on. */
++S32 TapMove_IsEnabled(void);
++
++/* Whether the overlay should leave the D-pad out right now: tap-to-walk is on
++ * AND gameplay is running. Two ways to steer on one screen is the clutter this
++ * exists to remove -- but menus, the inventory and the save list are still driven
++ * by direction keys, and on a touchscreen the D-pad is the only way to press them,
++ * so it comes back whenever a modal screen is up (no gameplay frame for a moment). */
++S32 TapMove_ReplacesDpad(void);
++
++/* A finger on empty glass. nx, ny are game-area normalised (0..1), the space
++ * TOUCH_INPUT.CPP's MapToGameCoords produces. Returns 1 if the touch was taken as
++ * a walk order, 0 if it was ignored (feature off, or no gameplay running: a tap
++ * on a dialogue or a menu must not queue a walk for after it closes). */
++S32 TapMove_Touch(float nx, float ny, S32 phase);
++
++/* Drop the current walk. */
++void TapMove_Cancel(void);
++
++/* Once per gameplay frame, after the real input has been read and before the
++ * simulation runs. Returns the movement bits to OR into Input. */
++U32 TapMove_Steer(void);
++
++/* Where the current destination is on screen, in logical pixels, for the
++ * overlay to mark. Returns 0 when there is no walk in progress. */
++S32 TapMove_GetMarker(S32 *sx, S32 *sy);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/SOURCES/TAPMOVE_MATH.CPP b/SOURCES/TAPMOVE_MATH.CPP
+new file mode 100644
+index 0000000..52baa42
+--- /dev/null
++++ b/SOURCES/TAPMOVE_MATH.CPP
+@@ -0,0 +1,166 @@
++/* The pure half of tap-to-walk: nothing here reads the game, only the camera the
++ * projection already holds. See TAPMOVE.H for the whole design. */
++
++#include "TAPMOVE.H"
++
++#include <3D/CAMERA.H>
++#include <3D/DATAMAT.H>
++#include <3D/LPROJ.H>
++#include <3D/LROT3D.H>
++
++#include <math.h>
++
++/* Steering thresholds, in 1/4096 of a turn.
++ *
++ * The hero turns at 1024 units a second while a turn key is held, so a frame at
++ * 30 fps moves the heading by about 34. TURN_OFF has to be wider than that or the
++ * heading would hop across the dead band and the key would chatter; TURN_ON is
++ * wider again so that a heading that has just settled is not set turning by the
++ * first stray frame. WALK_CONE is how far off the bearing the hero may be and
++ * still walk: inside it he walks an arc towards the spot, outside it he turns on
++ * the spot first, which keeps him from striding off in the wrong direction. */
++#define TAP_TURN_ON 128
++#define TAP_TURN_OFF 48
++#define TAP_WALK_CONE 320
++
++/* The solver's finite-difference probe, in world units (half a brick), the
++ * largest single correction it may take, and how many it gets. */
++#define TAP_PROBE 256
++#define TAP_MAX_STEP 4096.0
++#define TAP_SOLVE_ITERS 14
++
++/* How far, in pixels, the answer may land from the finger and still count. The
++ * isometric projection quantises to whole pixels, so ~1 is the floor. */
++#define TAP_CONVERGED_PX 1.0
++#define TAP_ACCEPT_PX 2.0
++
++/* Round to nearest, halves away from zero. The project builds as C++98, which has no lround. */
++static S32 Round(double v) {
++    return (S32)(v < 0.0 ? v - 0.5 : v + 0.5);
++}
++
++S32 TapMove_AngleError(S32 beta, S32 bearing) {
++    return (((bearing - beta) + 2048) & 4095) - 2048;
++}
++
++T_TAP_STEER TapMove_Aim(S32 beta, S32 bearing, S32 prevTurn) {
++    const S32 e = TapMove_AngleError(beta, bearing);
++    const S32 ae = (e < 0) ? -e : e;
++    T_TAP_STEER s;
++
++    s.turn = prevTurn;
++    if (ae > TAP_TURN_ON) {
++        s.turn = (e > 0) ? 1 : -1;
++    } else if (ae < TAP_TURN_OFF) {
++        s.turn = 0;
++    } else if (s.turn != 0 && ((e > 0) != (s.turn > 0))) {
++        /* Overshot into the dead band on the far side: stop, do not chase it. */
++        s.turn = 0;
++    }
++    s.forward = (ae < TAP_WALK_CONE) ? 1 : 0;
++    return s;
++}
++
++/* World point -> screen pixel with the camera and projection the game is drawing
++ * with. The same pair of calls every label, shadow and flow particle uses, so it
++ * is right for the isometric rooms and the perspective camera alike. */
++static S32 ProjectWorld(S32 x, S32 y, S32 z, S32 *sx, S32 *sy) {
++    LongWorldRotatePoint(x, y, z);
++    if (!LongProjectPoint(X0, Y0, Z0))
++        return 0;
++    *sx = Xp;
++    *sy = Yp;
++    return 1;
++}
++
++S32 TapMove_Project(S32 x, S32 y, S32 z, S32 *sx, S32 *sy) {
++    const S32 saveX0 = X0, saveY0 = Y0, saveZ0 = Z0, saveXp = Xp, saveYp = Yp;
++    const S32 ok = ProjectWorld(x, y, z, sx, sy);
++    X0 = saveX0;
++    Y0 = saveY0;
++    Z0 = saveZ0;
++    Xp = saveXp;
++    Yp = saveYp;
++    return ok;
++}
++
++S32 TapMove_SolveGround(S32 px, S32 py, S32 groundY, S32 startX, S32 startZ, S32 *outX, S32 *outZ) {
++    /* The projection leaves its result in these scratch globals. Nothing is
++     * supposed to rely on them across a frame boundary, but whoever called us
++     * did not ask for them to change. */
++    const S32 saveX0 = X0, saveY0 = Y0, saveZ0 = Z0, saveXp = Xp, saveYp = Yp;
++
++    double x = (double)startX;
++    double z = (double)startZ;
++    S32 ok = 0;
++
++    /* Newton's method on the two-variable map (x, z) -> (pixel x, pixel y) at a
++     * fixed height. The Jacobian comes from probing the projection itself, so
++     * there is no camera model to keep in step with the engine's: for the
++     * isometric camera the map is affine and one step lands it; for the
++     * perspective camera it is a homography and a few steps do. */
++    for (S32 it = 0; it < TAP_SOLVE_ITERS; it++) {
++        const S32 xi = Round(x);
++        const S32 zi = Round(z);
++        S32 sx, sy, ax, ay, bx, by;
++
++        if (!ProjectWorld(xi, groundY, zi, &sx, &sy))
++            break;
++
++        const double ex = (double)px - (double)sx;
++        const double ey = (double)py - (double)sy;
++        if (fabs(ex) <= TAP_CONVERGED_PX && fabs(ey) <= TAP_CONVERGED_PX) {
++            ok = 1;
++            break;
++        }
++
++        if (!ProjectWorld(xi + TAP_PROBE, groundY, zi, &ax, &ay) ||
++            !ProjectWorld(xi, groundY, zi + TAP_PROBE, &bx, &by))
++            break;
++
++        const double a = (double)(ax - sx) / TAP_PROBE;
++        const double b = (double)(bx - sx) / TAP_PROBE;
++        const double c = (double)(ay - sy) / TAP_PROBE;
++        const double d = (double)(by - sy) / TAP_PROBE;
++        const double det = a * d - b * c;
++        if (fabs(det) < 1e-12)
++            break;
++
++        double dx = (d * ex - b * ey) / det;
++        double dz = (a * ey - c * ex) / det;
++        const double len = sqrt(dx * dx + dz * dz);
++        if (!(len == len)) /* NaN */
++            break;
++        if (len > TAP_MAX_STEP) {
++            dx *= TAP_MAX_STEP / len;
++            dz *= TAP_MAX_STEP / len;
++        }
++        x += dx;
++        z += dz;
++    }
++
++    S32 rx = Round(x);
++    S32 rz = Round(z);
++
++    /* Out of iterations is not the same as wrong: take the last point if it
++     * projects back to within a couple of pixels of the finger. A point that does
++     * not (above the horizon, behind the camera) is refused. */
++    if (!ok) {
++        S32 sx, sy;
++        if (ProjectWorld(rx, groundY, rz, &sx, &sy) &&
++            fabs((double)px - (double)sx) <= TAP_ACCEPT_PX && fabs((double)py - (double)sy) <= TAP_ACCEPT_PX)
++            ok = 1;
++    }
++
++    X0 = saveX0;
++    Y0 = saveY0;
++    Z0 = saveZ0;
++    Xp = saveXp;
++    Yp = saveYp;
++
++    if (!ok)
++        return 0;
++    *outX = rx;
++    *outZ = rz;
++    return 1;
++}
+diff --git a/SOURCES/TAPMOVE_PATH.CPP b/SOURCES/TAPMOVE_PATH.CPP
+new file mode 100644
+index 0000000..8e511d2
+--- /dev/null
++++ b/SOURCES/TAPMOVE_PATH.CPP
+@@ -0,0 +1,259 @@
++/* Route finding for tap-to-walk, on the brick grid of an interior cube. The
++ * design, and where this fits, are in TAPMOVE.H.
++ *
++ * Pure: it knows nothing of the game. The caller says which cells can be stood on
++ * through a callback, which is what lets it be tested on invented maps. */
++
++#include "TAPMOVE.H"
++
++#include <string.h>
++
++#define PATH_DIM TAPPATH_GRID_MAX
++#define PATH_NODES (PATH_DIM * PATH_DIM)
++
++/* Integer costs of an orthogonal step and a diagonal one (1 : sqrt 2 to 1%). */
++#define COST_ORTH 10
++#define COST_DIAG 14
++
++/* A node can be pushed again each time a cheaper way to it is found; eight
++ * neighbours is the most a node can be relaxed from. */
++#define HEAP_MAX (PATH_NODES * 8)
++
++static T_TAP_WALKABLE s_walkable;
++static void *s_ctx;
++static S32 s_w, s_h;
++
++static U8 s_known[PATH_NODES]; /* 0 = not asked yet, 1 = walkable, 2 = blocked */
++static U8 s_state[PATH_NODES]; /* 0 = unseen, 1 = open, 2 = closed */
++static S32 s_g[PATH_NODES];
++static S32 s_f[PATH_NODES];
++static S16 s_parent[PATH_NODES];
++
++static S32 s_heapF[HEAP_MAX];
++static S16 s_heapN[HEAP_MAX];
++static S32 s_heapLen;
++
++void TapPath_Begin(T_TAP_WALKABLE walkable, void *ctx, S32 gridW, S32 gridH) {
++    s_walkable = walkable;
++    s_ctx = ctx;
++    s_w = (gridW > PATH_DIM) ? PATH_DIM : gridW;
++    s_h = (gridH > PATH_DIM) ? PATH_DIM : gridH;
++    memset(s_known, 0, sizeof(s_known));
++}
++
++/* Walkable, asked of the callback at most once per cell per query. */
++static S32 Walkable(S32 x, S32 z) {
++    if (x < 0 || z < 0 || x >= s_w || z >= s_h)
++        return 0;
++    U8 *k = &s_known[z * PATH_DIM + x];
++    if (*k == 0)
++        *k = s_walkable(s_ctx, x, z) ? 1 : 2;
++    return *k == 1;
++}
++
++static S32 Abs(S32 v) {
++    return v < 0 ? -v : v;
++}
++
++/* Octile distance: exact for a grid with no obstacles, never an over-estimate
++ * with them, so the first time A* reaches the goal it has the cheapest way. */
++static S32 Heuristic(S32 x, S32 z, S32 gx, S32 gz) {
++    const S32 dx = Abs(gx - x);
++    const S32 dz = Abs(gz - z);
++    const S32 lo = (dx < dz) ? dx : dz;
++    return COST_ORTH * (dx + dz) - (2 * COST_ORTH - COST_DIAG) * lo;
++}
++
++static void HeapPush(S32 f, S16 node) {
++    if (s_heapLen >= HEAP_MAX)
++        return;
++    S32 i = s_heapLen++;
++    while (i > 0) {
++        const S32 p = (i - 1) / 2;
++        if (s_heapF[p] <= f)
++            break;
++        s_heapF[i] = s_heapF[p];
++        s_heapN[i] = s_heapN[p];
++        i = p;
++    }
++    s_heapF[i] = f;
++    s_heapN[i] = node;
++}
++
++static S16 HeapPop(S32 *f) {
++    const S16 top = s_heapN[0];
++    *f = s_heapF[0];
++    s_heapLen--;
++    if (s_heapLen > 0) {
++        const S32 lf = s_heapF[s_heapLen];
++        const S16 ln = s_heapN[s_heapLen];
++        S32 i = 0;
++        for (;;) {
++            S32 c = 2 * i + 1;
++            if (c >= s_heapLen)
++                break;
++            if (c + 1 < s_heapLen && s_heapF[c + 1] < s_heapF[c])
++                c++;
++            if (s_heapF[c] >= lf)
++                break;
++            s_heapF[i] = s_heapF[c];
++            s_heapN[i] = s_heapN[c];
++            i = c;
++        }
++        s_heapF[i] = lf;
++        s_heapN[i] = ln;
++    }
++    return top;
++}
++
++S32 TapPath_Find(S32 sx, S32 sz, S32 gx, S32 gz, S16 *outX, S16 *outZ, S32 maxOut, S32 *reachedGoal) {
++    static const S8 kDx[8] = {1, -1, 0, 0, 1, 1, -1, -1};
++    static const S8 kDz[8] = {0, 0, 1, -1, 1, -1, 1, -1};
++
++    *reachedGoal = 0;
++    if (s_walkable == NULL || maxOut < 1 || sx < 0 || sz < 0 || sx >= s_w || sz >= s_h)
++        return 0;
++
++    /* A goal off the grid is the nearest cell on it. */
++    if (gx < 0)
++        gx = 0;
++    if (gz < 0)
++        gz = 0;
++    if (gx >= s_w)
++        gx = s_w - 1;
++    if (gz >= s_h)
++        gz = s_h - 1;
++
++    memset(s_state, 0, sizeof(s_state));
++    s_heapLen = 0;
++
++    /* Whoever is asking is standing on the start cell: it is walkable by
++       definition, whatever the grid says about the spot they are on (a ramp, a
++       doorway, a block they are pushing). */
++    const S32 start = sz * PATH_DIM + sx;
++    s_known[start] = 1;
++    s_g[start] = 0;
++    s_parent[start] = -1;
++    s_f[start] = Heuristic(sx, sz, gx, gz);
++    s_state[start] = 1;
++    HeapPush(s_f[start], (S16)start);
++
++    S32 best = start;
++    S32 bestH = Heuristic(sx, sz, gx, gz);
++
++    while (s_heapLen > 0) {
++        S32 f;
++        const S32 n = HeapPop(&f);
++        if (s_state[n] == 2 || f > s_f[n])
++            continue; /* a stale entry: a cheaper way to this cell was found since */
++        s_state[n] = 2;
++
++        const S32 nx = n % PATH_DIM;
++        const S32 nz = n / PATH_DIM;
++
++        const S32 h = Heuristic(nx, nz, gx, gz);
++        if (h < bestH || (h == bestH && s_g[n] < s_g[best])) {
++            best = n;
++            bestH = h;
++        }
++        if (nx == gx && nz == gz) {
++            *reachedGoal = 1;
++            break;
++        }
++
++        for (S32 d = 0; d < 8; d++) {
++            const S32 x = nx + kDx[d];
++            const S32 z = nz + kDz[d];
++            if (!Walkable(x, z))
++                continue;
++            /* No cutting corners: the hero is wider than a point, so a diagonal
++               needs both of the cells it brushes to be free. */
++            if (kDx[d] != 0 && kDz[d] != 0 && (!Walkable(nx + kDx[d], nz) || !Walkable(nx, nz + kDz[d])))
++                continue;
++
++            const S32 m = z * PATH_DIM + x;
++            if (s_state[m] == 2)
++                continue;
++            const S32 g = s_g[n] + ((kDx[d] != 0 && kDz[d] != 0) ? COST_DIAG : COST_ORTH);
++            if (s_state[m] == 0 || g < s_g[m]) {
++                s_g[m] = g;
++                s_parent[m] = (S16)n;
++                s_f[m] = g + Heuristic(x, z, gx, gz);
++                s_state[m] = 1;
++                HeapPush(s_f[m], (S16)m);
++            }
++        }
++    }
++
++    /* Walk back from the goal -- or, if it cannot be reached, from the reachable
++       cell nearest to it -- and lay the route out start first. */
++    S32 total = 0;
++    for (S32 t = best; t >= 0; t = s_parent[t])
++        total++;
++    const S32 len = (total > maxOut) ? maxOut : total;
++
++    /* A route longer than the room the caller has keeps its beginning. */
++    S32 c = best;
++    for (S32 skip = total - len; skip > 0; skip--)
++        c = s_parent[c];
++    if (total > len)
++        *reachedGoal = 0;
++
++    for (S32 i = len - 1; i >= 0; i--) {
++        outX[i] = (S16)(c % PATH_DIM);
++        outZ[i] = (S16)(c / PATH_DIM);
++        c = s_parent[c];
++    }
++    return len;
++}
++
++S32 TapPath_LineClear(S32 ax, S32 az, S32 bx, S32 bz) {
++    const S32 dx = Abs(bx - ax);
++    const S32 dz = Abs(bz - az);
++    const S32 sx = (ax < bx) ? 1 : -1;
++    const S32 sz = (az < bz) ? 1 : -1;
++    S32 err = dx - dz;
++    S32 x = ax;
++    S32 z = az;
++
++    for (;;) {
++        if (!Walkable(x, z))
++            return 0;
++        if (x == bx && z == bz)
++            return 1;
++
++        const S32 e2 = 2 * err;
++        S32 stepX = 0;
++        S32 stepZ = 0;
++        if (e2 > -dz) {
++            err -= dz;
++            stepX = sx;
++        }
++        if (e2 < dx) {
++            err += dx;
++            stepZ = sz;
++        }
++        if (stepX != 0 && stepZ != 0 && (!Walkable(x + stepX, z) || !Walkable(x, z + stepZ)))
++            return 0;
++        x += stepX;
++        z += stepZ;
++    }
++}
++
++S32 TapPath_Smooth(S16 *x, S16 *z, S32 n) {
++    if (n <= 2)
++        return n;
++
++    S32 kept = 1; /* x[0], z[0] stay where they are */
++    S32 i = 0;
++    while (i < n - 1) {
++        S32 j = n - 1;
++        while (j > i + 1 && !TapPath_LineClear(x[i], z[i], x[j], z[j]))
++            j--;
++        x[kept] = x[j];
++        z[kept] = z[j];
++        kept++;
++        i = j;
++    }
++    return kept;
++}
+diff --git a/SOURCES/TOUCH_INPUT.CPP b/SOURCES/TOUCH_INPUT.CPP
+index 2a40f00..45c4712 100644
+--- a/SOURCES/TOUCH_INPUT.CPP
++++ b/SOURCES/TOUCH_INPUT.CPP
+@@ -1,11 +1,13 @@
+ #include "TOUCH_INPUT.H"
+ 
+ #include "JOYSTICK.H" /* JoystickIsPresent: the pad half of the visibility rule */
++#include "TAPMOVE.H"  /* tap-to-walk: what a finger on empty glass does */
+ 
+ #include <SYSTEM/ANDROID.H>
+ #include <SYSTEM/KEYBOARD.H>
+ #include <SYSTEM/KEYBOARD_KEYS.H>
+ #include <SYSTEM/LOGPRINT.H>
++#include <SVGA/SCREEN.H> /* ModeDesiredX/Y: the logical pixels the projection works in */
+ #include <SVGA/VIDEO.H>
+ #include <SYSTEM/WINDOW.H>
+ 
+@@ -171,6 +173,7 @@ static struct {
+     S32 touchId;     /* SDL finger ID */
+     S32 active;      /* 1 = slot in use */
+     S32 actuate;     /* 0 = this finger only woke the overlay, it presses nothing */
++    S32 tap;         /* 1 = this finger landed on empty glass and is steering tap-to-walk */
+ } s_fingers[MAX_FINGERS];
+ 
+ /* ---------------------------------------------------------------------------
+@@ -285,8 +288,21 @@ static void MapToGameCoords(float *nx, float *ny) {
+     *ny = (float)surfY / (float)ModeResY;
+ }
+ 
++/* Whether a pill is on offer right now. The D-pad steps aside while tap-to-walk
++   has the hero, and comes back with every modal screen: menus, the inventory and
++   the save list are driven by direction keys, and on a touchscreen this is the only
++   way to press them. Hidden also means untouchable, so the glass it covered is free
++   to walk on. */
++static S32 ButtonShown(S32 i) {
++    if (kButtons[i].id >= BTN_DPAD_UP && kButtons[i].id <= BTN_DPAD_RIGHT)
++        return !TapMove_ReplacesDpad();
++    return 1;
++}
++
+ static S32 HitTest(float nx, float ny) {
+     for (S32 i = 0; i < NUM_TOUCH_BUTTONS; i++) {
++        if (!ButtonShown(i))
++            continue;
+         float dx = (nx - kButtons[i].cx) / kButtons[i].rx;
+         float dy = (ny - kButtons[i].cy) / kButtons[i].ry;
+         if (dx * dx + dy * dy <= 1.0f)
+@@ -357,11 +373,15 @@ static void ReleaseAllButtons(void) {
+         if (s_pressed[i])
+             SetButtonState(i, 0);
+     }
++    /* The finger that was steering a walk is forgotten with the rest, so its lift
++       will never arrive to say it is over. */
++    TapMove_Touch(0.0f, 0.0f, TAPMOVE_FINGER_UP);
+     memset(s_fingers, 0, sizeof(s_fingers));
+ }
+ 
+ void TouchOverlay_Shutdown(void) {
+     ReleaseAllButtons();
++    TapMove_Cancel();
+     s_supported = 0;
+ }
+ 
+@@ -404,9 +424,19 @@ S32 TouchOverlay_HandleEvent(const PlatformEvent *event) {
+         s_fingers[slot].touchId = (S32)ev->tfinger.fingerID;
+         s_fingers[slot].buttonIndex = idx;
+         s_fingers[slot].actuate = actuate;
+-
+-        if (idx < 0)
+-            break; /* empty glass: the wake above was the whole effect */
++        s_fingers[slot].tap = 0;
++
++        if (idx < 0) {
++            /* Empty glass. For a player already using touch it is an order: walk
++               there. One finger owns the walk at a time, the newest. */
++            if (actuate && TapMove_Touch(nx, ny, TAPMOVE_FINGER_DOWN)) {
++                for (S32 i = 0; i < MAX_FINGERS; i++)
++                    s_fingers[i].tap = 0;
++                s_fingers[slot].tap = 1;
++                consumed = 1;
++            }
++            break; /* otherwise the wake above was the whole effect */
++        }
+ 
+         if (kButtons[idx].id == BTN_HIDE) {
+             /* Gated like any other button: a palm brush from a pad session
+@@ -432,6 +462,10 @@ S32 TouchOverlay_HandleEvent(const PlatformEvent *event) {
+         S32 idx = s_fingers[slot].buttonIndex;
+         if (idx >= 0)
+             SetButtonState(idx, 0);
++        if (s_fingers[slot].tap) {
++            TapMove_Touch(0.0f, 0.0f, TAPMOVE_FINGER_UP);
++            s_fingers[slot].tap = 0;
++        }
+         s_fingers[slot].active = 0;
+         s_fingers[slot].actuate = 0;
+         /* The lift is what starts the idle clock: until it happens the finger
+@@ -447,6 +481,13 @@ S32 TouchOverlay_HandleEvent(const PlatformEvent *event) {
+         float nx = ev->tfinger.x;
+         float ny = ev->tfinger.y;
+         MapToGameCoords(&nx, &ny);
++        if (s_fingers[slot].tap) {
++            /* A finger steering the walk stays one wherever it goes: sliding it
++               over a pill must not press it. */
++            TapMove_Touch(nx, ny, TAPMOVE_FINGER_MOVE);
++            consumed = 1;
++            break;
++        }
+         S32 newIdx = HitTest(nx, ny);
+         S32 oldIdx = s_fingers[slot].buttonIndex;
+         if (newIdx != oldIdx) {
+@@ -616,6 +657,53 @@ static void DrawLabelCentred(U32 *fb, S32 pitchPixels, S32 x0, S32 y0, S32 x1, S
+     DrawStringARGB(fb, pitchPixels, tx, ty, label, 255, 255, 255, alpha, width, height);
+ }
+ 
++/* Where the walk is headed: a ring on the floor at the destination.
++ *
++ * Drawn whatever the overlay's fade says. The pills are gone a few seconds into a
++ * walk, which is the point of the fade; the spot the hero is walking to is what the
++ * player is watching, and it has to stay up until he gets there. (x, y) arrive in
++ * the logical pixels the projection works in, so they are scaled to the
++ * framebuffer the way ButtonRect scales the pills. */
++static void DrawTapMarker(U32 *fb, S32 pitchPixels, U32 width, U32 height) {
++    S32 mx, my;
++    if (!TapMove_GetMarker(&mx, &my) || ModeDesiredX == 0 || ModeDesiredY == 0)
++        return;
++
++    const S32 cx = (S32)((float)mx * (float)width / (float)ModeDesiredX);
++    const S32 cy = (S32)((float)my * (float)height / (float)ModeDesiredY);
++
++    S32 radius = (S32)(height / 32u);
++    if (radius < 8)
++        radius = 8;
++
++    /* A slow pulse, so it reads as "going here" and not as part of the art. */
++    const U32 phase = (U32)(g_platform.system.ticks_ms() % 900u);
++    const S32 pulse = (phase < 450u) ? (S32)(phase / 90u) : (S32)((900u - phase) / 90u); /* 0..5..0 */
++    const S32 r = radius + pulse * radius / 12;
++    const S32 thick = (radius / 5 > 2) ? radius / 5 : 2;
++    const S32 rIn = r - thick;
++
++    for (S32 y = cy - r - 2; y <= cy + r + 2; y++) {
++        if (y < 0 || y >= (S32)height)
++            continue;
++        for (S32 x = cx - r - 2; x <= cx + r + 2; x++) {
++            if (x < 0 || x >= (S32)width)
++                continue;
++            const S32 dx = x - cx;
++            const S32 dy = y - cy;
++            const S32 d2 = dx * dx + dy * dy;
++            U32 *px = &fb[y * pitchPixels + x];
++
++            if ((d2 <= r * r && d2 >= rIn * rIn) || d2 <= thick * thick) {
++                BlendPixel(px, 255, 255, 255, 230); /* the ring and the dot */
++            } else if ((d2 > r * r && d2 <= (r + 2) * (r + 2)) ||
++                       (d2 < rIn * rIn && d2 >= (rIn - 2) * (rIn - 2))) {
++                BlendPixel(px, 0, 0, 0, 120); /* a dark edge, so it shows on pale floors too */
++            }
++        }
++    }
++}
++
+ void TouchOverlay_Render(U32 *frameBuffer, U32 pitch, U32 width, U32 height,
+                          const U8 *palette_rgb) {
+     (void)palette_rgb;
+@@ -624,6 +712,8 @@ void TouchOverlay_Render(U32 *frameBuffer, U32 pitch, U32 width, U32 height,
+ 
+     S32 pitchPixels = (S32)(pitch / sizeof(U32));
+ 
++    DrawTapMarker(frameBuffer, pitchPixels, width, height);
++
+     const OverlayLevel level = CurrentLevel();
+     if (level == OVL_OFF)
+         return;
+@@ -637,6 +727,8 @@ void TouchOverlay_Render(U32 *frameBuffer, U32 pitch, U32 width, U32 height,
+     for (S32 i = 0; i < NUM_TOUCH_BUTTONS; i++) {
+         const TouchButton *btn = &kButtons[i];
+         S32 x0, y0, x1, y1;
++        if (!ButtonShown(i))
++            continue;
+         if (!ButtonRect(btn, 1.0f, width, height, &x0, &y0, &x1, &y1))
+             continue;
+ 
+diff --git a/docs/ANDROID.md b/docs/ANDROID.md
+index 42c1ce4..cabf9c4 100644
+--- a/docs/ANDROID.md
++++ b/docs/ANDROID.md
+@@ -306,7 +306,9 @@ The on-screen virtual gamepad uses the following layout:
+ - **HIDE** — Dismiss the controls now; the next touch brings them back
+ - **MEN** — Menu (F10 / in-game menu)
+ - **CAM** — Camera toggle (Backspace)
+-- **D-pad** — U/D/L/R → Arrow keys (movement)
++- **D-pad** — U/D/L/R → Arrow keys (movement). With [tap to walk](#tap-to-walk) on (the default) it is
++  left out while the game is running; it comes back on the menus, the inventory and the
++  save list, which are driven by direction keys
+ - **MD** — Mode (Ctrl / behaviour mode)
+ - **ACT** — Action (Space / jump/interact)
+ - **USE** — Use/confirm (Enter)
+@@ -317,6 +319,49 @@ The on-screen virtual gamepad uses the following layout:
+ The layout is defined in `SOURCES/TOUCH_INPUT.CPP` and can be customised
+ by editing the `kButtons[]` table (normalised 0..1 coordinates).
+ 
++## Tap to walk
++
++Touch the floor and Twinsen walks there. Keep the finger down and he follows it; lift it and he
++carries on to the last spot. A ring on the floor marks where he is heading, and stays up after the
++buttons have faded. The tank-style D-pad is still there if you prefer it (see the setting below).
++
++How it behaves, and why it is built that way, is written up in
++[`TAPMOVE.H`](../SOURCES/TAPMOVE.H). In short:
++
++- **A touch on empty glass is a walk order.** A touch that lands on a button is that button's. The
++  first touch after using another device only wakes the overlay, as everywhere else.
++- **It presses the keys a player would.** Each gameplay frame `TapMove_Steer` ORs the up / left /
++  right bits into the input the engine reads, right where the replay harness ORs its own.
++  Animations, speed, collisions, climbing, swimming and the behaviour modes are the engine's
++  existing movement code, untouched.
++- **The touch becomes a spot on the floor through the camera the frame was drawn with**, at the
++  height of the hero's feet: the engine's own world-to-screen projection is inverted, so it holds
++  for the classic isometric rooms and the perspective Auto camera alike.
++- **Interiors route round obstacles.** The route is found on the cube's brick grid (A\*,
++  eight-way moves, no corner cutting, straightened afterwards), so a tap on the far side of a wall
++  walks round it, and a spot that is walled off is approached as closely as it can be. Islands are
++  not on the brick grid: there he walks straight at the spot.
++- **It stops** on arrival; on a new tap; on any keyboard or gamepad movement; when the hero leaves
++  manual control (a cutscene, a script, death); when a dialogue, a menu or the inventory comes up;
++  after about twenty seconds; and when he is blocked: the first time the route is worked out again
++  from where he stands, the second time the order is dropped.
++- **It is off during replays and the scripted harness.** A recording already holds the keys this
++  produced; generating them again would drive the hero twice.
++
++The switch is `TouchTapToMove` in `lba2.cfg`, or `touch_tap_move` on the console
++(see [`CONFIG_FILE.CPP`](../SOURCES/CONFIG_FILE.CPP)): `1` (the default) for tap to walk, `0` for the
++on-screen D-pad as before.
++
++Limits worth knowing:
++
++- Routes are planned on the floor the hero is standing on. A spot on another level of a room (up a
++  staircase, on a platform) is found at his own height, not where it appears on screen, and a route
++  does not climb.
++- Things the brick grid does not contain (a character in the way, a block being pushed) are not
++  routed round; the walk is dropped after the re-plan finds it blocked again.
++- It has not been exercised on every scene: if a route goes somewhere odd, the D-pad setting is the
++  way out, and the scene is worth reporting.
++
+ ## When the overlay shows
+ 
+ It follows the last input device the player actually used, and fades when they
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7df67e0..437eecf 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -69,6 +69,7 @@ add_subdirectory(plasma_steps)
+ add_subdirectory(boot_end)
+ add_subdirectory(crash)
+ add_subdirectory(camera)
++add_subdirectory(tapmove)
+ add_subdirectory(precision_paths)
+ add_subdirectory(numeric_contract)
+ add_subdirectory(muldiv64)
+diff --git a/tests/platform/test_platform_contract.cpp b/tests/platform/test_platform_contract.cpp
+index 62e368c..fdabdbb 100644
+--- a/tests/platform/test_platform_contract.cpp
++++ b/tests/platform/test_platform_contract.cpp
+@@ -15,6 +15,7 @@
+ #include <SYSTEM/WINDOW.H>
+ 
+ #include "JOYSTICK.H"
++#include "TAPMOVE.H"
+ #include "TOUCH_INPUT.H"
+ 
+ #include <cstdlib>
+@@ -41,6 +42,19 @@ U32 SizeChar = 8;
+ S32 CubeMode = 0;
+ S32 GamepadCameraAnalog = 0;
+ S32 FollowCamera = 0;
++
++// TAPMOVE.CPP is the game side of tap-to-walk and drags the engine in with it. The overlay asks
++// it four things; here the answer is always "not walking", which is the overlay as it was.
++S32 TapMove_ReplacesDpad(void) {
++    return 0;
++}
++S32 TapMove_Touch(float, float, S32) {
++    return 0;
++}
++void TapMove_Cancel(void) {}
++S32 TapMove_GetMarker(S32 *, S32 *) {
++    return 0;
++}
+ }
+ 
+ namespace {
+diff --git a/tests/tapmove/CMakeLists.txt b/tests/tapmove/CMakeLists.txt
+new file mode 100644
+index 0000000..8a48dba
+--- /dev/null
++++ b/tests/tapmove/CMakeLists.txt
+@@ -0,0 +1,40 @@
++# Host tests for tap-to-walk (SOURCES/TAPMOVE.H): the route finder, and the maths that turns a touch
++# into a spot on the floor and a heading into key presses. Neither half reads the game, so they run
++# anywhere with no retail data and no display. The part that does read it (TAPMOVE.CPP: the touch,
++# the destination, the stop conditions) is exercised by hand on a device.
++add_executable(test_tapmove_path
++    test_tapmove_path.cpp
++    ${CMAKE_SOURCE_DIR}/SOURCES/TAPMOVE_PATH.CPP)
++
++target_include_directories(test_tapmove_path PRIVATE
++    ${CMAKE_SOURCE_DIR}/LIB386/H   # SYSTEM/ADELINE_TYPES.H
++    ${CMAKE_SOURCE_DIR}/SOURCES    # TAPMOVE.H
++    ${CMAKE_SOURCE_DIR}/tests      # test_harness.h
++)
++target_compile_definitions(test_tapmove_path PRIVATE
++    "TEST_SOURCE_ROOT=\"${CMAKE_SOURCE_DIR}/\""
++)
++set_target_properties(test_tapmove_path PROPERTIES CXX_STANDARD 11)
++
++add_test(NAME test_tapmove_path COMMAND test_tapmove_path)
++register_host_test(test_tapmove_path)
++
++# The maths half runs on the engine's own projection, so it links the 3D library: the point of
++# inverting the live camera, rather than a model of it, is that it cannot drift from what is drawn.
++add_executable(test_tapmove_math
++    test_tapmove_math.cpp
++    ${CMAKE_SOURCE_DIR}/SOURCES/TAPMOVE_MATH.CPP)
++
++target_include_directories(test_tapmove_math PRIVATE
++    ${CMAKE_SOURCE_DIR}/LIB386/H
++    ${CMAKE_SOURCE_DIR}/SOURCES
++    ${CMAKE_SOURCE_DIR}/tests
++)
++target_compile_definitions(test_tapmove_math PRIVATE
++    "TEST_SOURCE_ROOT=\"${CMAKE_SOURCE_DIR}/\""
++)
++target_link_libraries(test_tapmove_math PRIVATE 3D)
++set_target_properties(test_tapmove_math PROPERTIES CXX_STANDARD 11)
++
++add_test(NAME test_tapmove_math COMMAND test_tapmove_math)
++register_host_test(test_tapmove_math)
+diff --git a/tests/tapmove/test_tapmove_math.cpp b/tests/tapmove/test_tapmove_math.cpp
+new file mode 100644
+index 0000000..73306aa
+--- /dev/null
++++ b/tests/tapmove/test_tapmove_math.cpp
+@@ -0,0 +1,257 @@
++/* Host test for tap-to-walk's maths (SOURCES/TAPMOVE_MATH.CPP): the inversion of the live camera
++ * that turns a touch into a spot on the floor, and the steering that turns a heading into key
++ * presses.
++ *
++ * The inversion is checked on the engine's own projection (the 3D library), not on a model of it:
++ * the whole reason it works through LongWorldRotatePoint/LongProjectPoint is that it cannot drift
++ * from what is drawn, so the test must not be a second opinion on what is drawn either. What is
++ * asked of it is the thing a player sees: the point it hands back, projected again, lands under the
++ * finger.
++ */
++#include "TAPMOVE.H"
++#include "test_harness.h"
++
++#include <3D/CAMERA.H>
++#include <3D/DATAMAT.H>
++#include <3D/LPROJ.H>
++#include <3D/LROT3D.H>
++#include <3D/PROJ.H>
++
++#include <math.h>
++#include <stdlib.h>
++
++/* What the 3D library reaches for outside itself, on paths this test does not drive. */
++extern "C" {
++volatile U32 TimerRefHR = 0;
++S32 ScreenXMin = 0, ScreenXMax = 639, ScreenYMin = 0, ScreenYMax = 479;
++}
++
++#define SCREEN_W 640
++#define SCREEN_H 480
++
++static S32 project(S32 x, S32 y, S32 z, S32 *sx, S32 *sy) {
++    LongWorldRotatePoint(x, y, z);
++    if (!LongProjectPoint(X0, Y0, Z0))
++        return 0;
++    *sx = Xp;
++    *sy = Yp;
++    return 1;
++}
++
++static unsigned g_seed = 1234567u;
++static int rnd(int n) {
++    g_seed = g_seed * 1664525u + 1013904223u;
++    return (int)((g_seed >> 8) % (unsigned)n);
++}
++
++/* Project a scatter of floor points, ask for each back from its pixel, and count what goes wrong:
++ * answers that do not land back within two pixels of the finger (the failure that matters), points
++ * it declined to answer for, and the worst the answer was out in the world. */
++static void sweep(S32 hx, S32 hy, S32 hz, S32 range, S32 *tried, S32 *pixelFail, S32 *refused, double *worstWorld) {
++    int i;
++    *tried = *pixelFail = *refused = 0;
++    *worstWorld = 0;
++    for (i = 0; i < 1500; i++) {
++        S32 x = hx + rnd(2 * range + 1) - range;
++        S32 z = hz + rnd(2 * range + 1) - range;
++        S32 sx, sy, gx, gz, rx, ry;
++        double err;
++
++        if (!project(x, hy, z, &sx, &sy) || sx < 0 || sx >= SCREEN_W || sy < 0 || sy >= SCREEN_H)
++            continue;
++        (*tried)++;
++        if (!TapMove_SolveGround(sx, sy, hy, hx, hz, &gx, &gz)) {
++            (*refused)++;
++            continue;
++        }
++        err = hypot((double)(gx - x), (double)(gz - z));
++        if (err > *worstWorld)
++            *worstWorld = err;
++        if (!project(gx, hy, gz, &rx, &ry) || abs(rx - sx) > 2 || abs(ry - sy) > 2)
++            (*pixelFail)++;
++    }
++}
++
++static void test_isometric_camera_inverts_exactly(void) {
++    const S32 hx = 20000, hy = 2048, hz = 15000;
++    S32 tried, pixelFail, refused;
++    double worst;
++
++    SetIsoProjection(SCREEN_W / 2 - 9, SCREEN_H / 2);
++    SetPosCamera(hx, hy, hz);
++    SetAngleCamera(0, 0, 0);
++    sweep(hx, hy, hz, 6000, &tried, &pixelFail, &refused, &worst);
++    ASSERT_TRUE(tried > 500);
++    ASSERT_EQ_INT(0, pixelFail);
++    ASSERT_EQ_INT(0, refused);
++    /* a pixel is 21 world units wide in x and about 43 deep, so one pixel of rounding is the floor */
++    ASSERT_TRUE(worst <= 64.0);
++
++    /* and with the camera somewhere other than on the hero */
++    SetPosCamera(hx + 3000, hy + 512, hz - 2000);
++    sweep(hx, hy, hz, 4000, &tried, &pixelFail, &refused, &worst);
++    ASSERT_TRUE(tried > 300);
++    ASSERT_EQ_INT(0, pixelFail);
++    ASSERT_EQ_INT(0, refused);
++    ASSERT_TRUE(worst <= 64.0);
++}
++
++static void test_perspective_camera_inverts_across_the_auto_cameras_range(void) {
++    const S32 hx = 20000, hy = 2048, hz = 15000;
++    const S32 fovs[2] = {600, 1000};
++    const S32 alphas[3] = {150, 300, 600}; /* elevation: the Auto camera's range is about 150..600 */
++    const S32 betas[4] = {0, 700, 2048, 3300};
++    const S32 dists[3] = {7000, 12000, 20000};
++    int a, b, c, d;
++    S32 totalTried = 0, totalFail = 0, totalRefused = 0;
++    double worstAny = 0;
++
++    for (a = 0; a < 2; a++)
++        for (b = 0; b < 3; b++)
++            for (c = 0; c < 4; c++)
++                for (d = 0; d < 3; d++) {
++                    S32 tried, pixelFail, refused;
++                    double worst;
++                    SetProjection(SCREEN_W / 2, SCREEN_H / 2, 128, fovs[a], fovs[a]);
++                    SetFollowCamera(hx, hy, hz, alphas[b], betas[c], 0, dists[d]);
++                    sweep(hx, hy, hz, 5000, &tried, &pixelFail, &refused, &worst);
++                    totalTried += tried;
++                    totalFail += pixelFail;
++                    totalRefused += refused;
++                    if (worst > worstAny)
++                        worstAny = worst;
++                }
++
++    ASSERT_TRUE(totalTried > 50000);
++    ASSERT_EQ_INT(0, totalFail);                  /* never an answer that is not under the finger */
++    ASSERT_TRUE(totalRefused * 100 < totalTried); /* declines are rare: under 1% */
++    /* The shallowest views at the longest range put hundreds of units under one pixel, so the world
++     * error is bounded by a brick, not by a few pixels' worth. */
++    ASSERT_TRUE(worstAny < 600.0);
++}
++
++static void test_a_tap_above_the_horizon_is_refused(void) {
++    const S32 hx = 20000, hy = 2048, hz = 15000;
++    S32 gx, gz;
++
++    SetProjection(SCREEN_W / 2, SCREEN_H / 2, 128, 1000, 1000);
++    SetFollowCamera(hx, hy, hz, 150, 0, 0, 12000);
++    ASSERT_EQ_INT(0, TapMove_SolveGround(SCREEN_W / 2, 2, hy, hx, hz, &gx, &gz));
++}
++
++static void test_project_and_solve_leave_the_scratch_globals_alone(void) {
++    const S32 hx = 20000, hy = 2048, hz = 15000;
++    S32 sx, sy, gx, gz;
++
++    SetIsoProjection(SCREEN_W / 2 - 9, SCREEN_H / 2);
++    SetPosCamera(hx, hy, hz);
++    SetAngleCamera(0, 0, 0);
++
++    X0 = 111;
++    Y0 = 222;
++    Z0 = 333;
++    Xp = 444;
++    Yp = 555;
++    ASSERT_EQ_INT(1, TapMove_Project(hx + 1000, hy, hz + 500, &sx, &sy));
++    ASSERT_TRUE(X0 == 111 && Y0 == 222 && Z0 == 333 && Xp == 444 && Yp == 555);
++    ASSERT_EQ_INT(1, TapMove_SolveGround(sx, sy, hy, hx, hz, &gx, &gz));
++    ASSERT_TRUE(X0 == 111 && Y0 == 222 && Z0 == 333 && Xp == 444 && Yp == 555);
++}
++
++static void test_angle_error_takes_the_short_way(void) {
++    S32 a, b, bad = 0;
++
++    ASSERT_EQ_INT(0, TapMove_AngleError(100, 100));
++    ASSERT_EQ_INT(-16, TapMove_AngleError(10, 4090)); /* across 0, not round through 2048 */
++    ASSERT_EQ_INT(16, TapMove_AngleError(4090, 10));
++    ASSERT_EQ_INT(1024, TapMove_AngleError(0, 1024));
++    ASSERT_EQ_INT(-1024, TapMove_AngleError(0, 3072));
++    ASSERT_EQ_INT(-2048, TapMove_AngleError(0, 2048)); /* dead behind: a defined side, not a coin toss */
++
++    for (a = 0; a < 4096; a += 7)
++        for (b = 0; b < 4096; b += 11) {
++            S32 e = TapMove_AngleError(a, b);
++            if (e < -2048 || e > 2047 || ((a + e) & 4095) != b)
++                bad++;
++        }
++    ASSERT_EQ_INT(0, bad);
++}
++
++static void test_aim_turns_toward_the_bearing_and_walks_when_close_to_it(void) {
++    T_TAP_STEER s;
++
++    s = TapMove_Aim(0, 1024, 0); /* the spot is a quarter turn to the side where the heading grows */
++    ASSERT_EQ_INT(1, s.turn);
++    ASSERT_EQ_INT(0, s.forward); /* turn on the spot first: do not stride off the wrong way */
++
++    s = TapMove_Aim(0, 3072, 0);
++    ASSERT_EQ_INT(-1, s.turn);
++    ASSERT_EQ_INT(0, s.forward);
++
++    s = TapMove_Aim(1000, 1010, 0); /* nearly there: no turn key, walk */
++    ASSERT_EQ_INT(0, s.turn);
++    ASSERT_EQ_INT(1, s.forward);
++
++    s = TapMove_Aim(1000, 1200, 0); /* off by 200: an arc, turning and walking at once */
++    ASSERT_EQ_INT(1, s.turn);
++    ASSERT_EQ_INT(1, s.forward);
++}
++
++static void test_aim_holds_a_turn_until_nearly_aligned_but_does_not_chase(void) {
++    T_TAP_STEER s;
++
++    s = TapMove_Aim(0, 100, 1); /* inside the band where a turn already going is kept */
++    ASSERT_EQ_INT(1, s.turn);
++    s = TapMove_Aim(0, 100, 0); /* ...and one not yet started is not begun there */
++    ASSERT_EQ_INT(0, s.turn);
++    s = TapMove_Aim(0, 20, 1); /* near enough: let go */
++    ASSERT_EQ_INT(0, s.turn);
++    s = TapMove_Aim(100, 0, 1); /* overshot into the band on the far side: stop, do not turn back */
++    ASSERT_EQ_INT(0, s.turn);
++}
++
++/* Every start, every bearing, at the frame sizes of a 60 fps and a 30 fps device (the hero turns
++ * 1024 a second while a key is held): the heading settles, and the key is pressed and released once
++ * rather than chattering. The walk animation restarts whenever the movement bits change, so chatter
++ * would be seen. */
++static void test_aim_converges_without_chatter_at_any_frame_rate(void) {
++    S32 step, start, bearing;
++    S32 worstToggles = 0, nonConverged = 0;
++
++    for (step = 17; step <= 34; step += 17)
++        for (start = 0; start < 4096; start += 37)
++            for (bearing = 0; bearing < 4096; bearing += 53) {
++                S32 beta = start, turn = 0, prev = 0, toggles = 0, frames, e;
++                for (frames = 0; frames < 400; frames++) {
++                    T_TAP_STEER s = TapMove_Aim(beta, bearing, turn);
++                    turn = s.turn;
++                    if (turn != prev) {
++                        toggles++;
++                        prev = turn;
++                    }
++                    beta = (beta + turn * step) & 4095;
++                    if (turn == 0 && s.forward)
++                        break;
++                }
++                e = TapMove_AngleError(beta, bearing);
++                if (frames >= 400 || (e < 0 ? -e : e) > 320)
++                    nonConverged++;
++                if (toggles > worstToggles)
++                    worstToggles = toggles;
++            }
++    ASSERT_EQ_INT(0, nonConverged);
++    ASSERT_TRUE(worstToggles <= 3); /* on, off, and at most one reversal */
++}
++
++int main(void) {
++    RUN_TEST(test_isometric_camera_inverts_exactly);
++    RUN_TEST(test_perspective_camera_inverts_across_the_auto_cameras_range);
++    RUN_TEST(test_a_tap_above_the_horizon_is_refused);
++    RUN_TEST(test_project_and_solve_leave_the_scratch_globals_alone);
++    RUN_TEST(test_angle_error_takes_the_short_way);
++    RUN_TEST(test_aim_turns_toward_the_bearing_and_walks_when_close_to_it);
++    RUN_TEST(test_aim_holds_a_turn_until_nearly_aligned_but_does_not_chase);
++    RUN_TEST(test_aim_converges_without_chatter_at_any_frame_rate);
++    TEST_SUMMARY();
++    return test_failures != 0;
++}
+diff --git a/tests/tapmove/test_tapmove_path.cpp b/tests/tapmove/test_tapmove_path.cpp
+new file mode 100644
+index 0000000..9fcbda3
+--- /dev/null
++++ b/tests/tapmove/test_tapmove_path.cpp
+@@ -0,0 +1,349 @@
++/* Host test for tap-to-walk's route finder (SOURCES/TAPMOVE_PATH.CPP).
++ *
++ * The finder is pure -- the caller says which cells can be stood on -- so it is checked on invented
++ * maps: the hand-made ones pin the behaviour a player would notice (round a wall, stop at a wall,
++ * never cut a corner), and a sweep over thousands of random grids checks the two claims everything
++ * else rests on against a plain Dijkstra: a route that is returned is legal, and one that reaches
++ * the goal is the cheapest there is.
++ */
++#include "TAPMOVE.H"
++#include "test_harness.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#define DIM 64
++
++static int g_w, g_h;
++static unsigned char g_blocked[DIM][DIM];
++static int g_startX, g_startZ;
++
++static void clear_map(int w, int h) {
++    g_w = w;
++    g_h = h;
++    memset(g_blocked, 0, sizeof(g_blocked));
++    g_startX = g_startZ = -1;
++}
++
++static S32 walkable_cb(void *ctx, S32 x, S32 z) {
++    (void)ctx;
++    return !g_blocked[z][x];
++}
++
++/* What the finder is entitled to assume: the cell the asker stands on is walkable, whatever the
++ * grid says about it. The reference below uses the same rule. */
++static int walk(int x, int z) {
++    if (x < 0 || z < 0 || x >= g_w || z >= g_h)
++        return 0;
++    if (x == g_startX && z == g_startZ)
++        return 1;
++    return !g_blocked[z][x];
++}
++
++static int step_cost(int dx, int dz) {
++    return (dx != 0 && dz != 0) ? 14 : 10;
++}
++
++/* The cost of a route, or -1 if any step of it is not a legal one. */
++static int route_cost(const S16 *x, const S16 *z, int n) {
++    int i, cost = 0;
++    for (i = 1; i < n; i++) {
++        int dx = x[i] - x[i - 1], dz = z[i] - z[i - 1];
++        if (dx < -1 || dx > 1 || dz < -1 || dz > 1 || (dx == 0 && dz == 0))
++            return -1;
++        if (!walk(x[i], z[i]))
++            return -1;
++        if (dx != 0 && dz != 0 && (!walk(x[i - 1] + dx, z[i - 1]) || !walk(x[i - 1], z[i - 1] + dz)))
++            return -1; /* cut a corner */
++        cost += step_cost(dx, dz);
++    }
++    return cost;
++}
++
++/* Reference: cheapest cost from the start to every cell, by relaxing until nothing changes. Slow
++ * and obvious, which is the point of it. */
++static void dijkstra(int sx, int sz, int dist[DIM][DIM]) {
++    static const int DX[8] = {1, -1, 0, 0, 1, 1, -1, -1};
++    static const int DZ[8] = {0, 0, 1, -1, 1, -1, 1, -1};
++    int x, z, d, changed = 1;
++
++    for (z = 0; z < DIM; z++)
++        for (x = 0; x < DIM; x++)
++            dist[z][x] = -1;
++    dist[sz][sx] = 0;
++
++    while (changed) {
++        changed = 0;
++        for (z = 0; z < g_h; z++) {
++            for (x = 0; x < g_w; x++) {
++                if (dist[z][x] < 0)
++                    continue;
++                for (d = 0; d < 8; d++) {
++                    int nx = x + DX[d], nz = z + DZ[d], c;
++                    if (!walk(nx, nz))
++                        continue;
++                    if (DX[d] != 0 && DZ[d] != 0 && (!walk(x + DX[d], z) || !walk(x, z + DZ[d])))
++                        continue;
++                    c = dist[z][x] + step_cost(DX[d], DZ[d]);
++                    if (dist[nz][nx] < 0 || c < dist[nz][nx]) {
++                        dist[nz][nx] = c;
++                        changed = 1;
++                    }
++                }
++            }
++        }
++    }
++}
++
++static int octile(int x, int z, int gx, int gz) {
++    int dx = abs(gx - x), dz = abs(gz - z), lo = dx < dz ? dx : dz;
++    return 10 * (dx + dz) - 6 * lo;
++}
++
++static S32 find(int sx, int sz, int gx, int gz, S16 *x, S16 *z, S32 *reached) {
++    g_startX = sx;
++    g_startZ = sz;
++    TapPath_Begin(walkable_cb, NULL, g_w, g_h);
++    return TapPath_Find(sx, sz, gx, gz, x, z, 600, reached);
++}
++
++static void test_open_ground_route_is_the_cheapest(void) {
++    S16 x[600], z[600];
++    S32 reached;
++    S32 n;
++
++    clear_map(16, 16);
++    n = find(2, 2, 9, 5, x, z, &reached);
++    /* three diagonals and four straights: 3 * 14 + 4 * 10 */
++    ASSERT_EQ_INT(8, n);
++    ASSERT_EQ_INT(1, reached);
++    ASSERT_EQ_INT(82, route_cost(x, z, n));
++    ASSERT_EQ_INT(2, x[0]);
++    ASSERT_EQ_INT(2, z[0]);
++    ASSERT_EQ_INT(9, x[n - 1]);
++    ASSERT_EQ_INT(5, z[n - 1]);
++}
++
++static void test_a_wall_with_a_gap_is_gone_round(void) {
++    S16 x[600], z[600];
++    S32 reached, n;
++    int i, through = 0;
++
++    clear_map(16, 16);
++    for (i = 0; i < 12; i++)
++        g_blocked[i][8] = 1; /* a wall down column 8, open from row 12 */
++    n = find(4, 5, 12, 5, x, z, &reached);
++    ASSERT_EQ_INT(1, reached);
++    for (i = 0; i < n; i++)
++        if (x[i] == 8)
++            through = (z[i] >= 12);
++    ASSERT_EQ_INT(1, through);
++    ASSERT_TRUE(route_cost(x, z, n) > 0);
++}
++
++static void test_a_goal_inside_a_wall_ends_at_the_nearest_reachable_cell(void) {
++    S16 x[600], z[600];
++    S32 reached, n;
++    int ok;
++
++    clear_map(16, 16);
++    g_blocked[6][12] = 1; /* the goal itself is solid */
++    n = find(2, 6, 12, 6, x, z, &reached);
++    ASSERT_EQ_INT(0, reached);
++    /* it walks up to the wall: the cell just short of it, on the near side */
++    ok = (x[n - 1] == 11 && z[n - 1] == 6);
++    ASSERT_EQ_INT(1, ok);
++}
++
++static void test_a_goal_walled_in_is_approached_not_entered(void) {
++    S16 x[600], z[600];
++    S32 reached, n;
++    int dx, dz, ok;
++
++    clear_map(24, 24);
++    for (dz = -1; dz <= 1; dz++)
++        for (dx = -1; dx <= 1; dx++)
++            if (dx != 0 || dz != 0)
++                g_blocked[12 + dz][12 + dx] = 1; /* a ring round (12, 12) */
++    n = find(2, 12, 12, 12, x, z, &reached);
++    ASSERT_EQ_INT(0, reached);
++    /* two cells from the goal along an axis is as close as the ring allows */
++    ok = (octile(x[n - 1], z[n - 1], 12, 12) == 20);
++    ASSERT_EQ_INT(1, ok);
++}
++
++static void test_a_diagonal_never_cuts_a_corner(void) {
++    S16 x[600], z[600];
++    S32 reached, n;
++
++    /* both neighbours of the diagonal are solid: the goal cannot be got to */
++    clear_map(4, 4);
++    g_blocked[0][1] = 1;
++    g_blocked[1][0] = 1;
++    n = find(0, 0, 1, 1, x, z, &reached);
++    ASSERT_EQ_INT(0, reached);
++    ASSERT_EQ_INT(1, n); /* boxed in: it stays where it is */
++
++    /* one is solid: the diagonal is still refused, the way round the other is taken */
++    clear_map(4, 4);
++    g_blocked[0][1] = 1;
++    n = find(0, 0, 1, 1, x, z, &reached);
++    ASSERT_EQ_INT(1, reached);
++    ASSERT_EQ_INT(3, n);
++    ASSERT_EQ_INT(0, x[1]);
++    ASSERT_EQ_INT(1, z[1]);
++}
++
++static void test_the_start_cell_is_always_walkable(void) {
++    S16 x[600], z[600];
++    S32 reached, n;
++
++    clear_map(8, 8);
++    g_blocked[3][3] = 1; /* the grid says he is inside a wall (a ramp, a doorway) */
++    n = find(3, 3, 6, 3, x, z, &reached);
++    ASSERT_EQ_INT(1, reached);
++    ASSERT_EQ_INT(4, n);
++    ASSERT_EQ_INT(3, x[0]);
++}
++
++static void test_a_goal_off_the_grid_is_the_nearest_cell_on_it(void) {
++    S16 x[600], z[600];
++    S32 reached, n;
++
++    clear_map(10, 10);
++    n = find(2, 5, 100, 5, x, z, &reached);
++    ASSERT_EQ_INT(1, reached);
++    ASSERT_EQ_INT(9, x[n - 1]);
++    ASSERT_EQ_INT(5, z[n - 1]);
++}
++
++static void test_a_route_longer_than_the_room_keeps_its_beginning(void) {
++    S16 x[4], z[4];
++    S32 reached, n;
++
++    clear_map(16, 16);
++    g_startX = 0;
++    g_startZ = 0;
++    TapPath_Begin(walkable_cb, NULL, 16, 16);
++    n = TapPath_Find(0, 0, 10, 0, x, z, 4, &reached);
++    ASSERT_EQ_INT(4, n);
++    ASSERT_EQ_INT(0, reached);
++    ASSERT_EQ_INT(0, x[0]);
++    ASSERT_EQ_INT(3, x[3]);
++}
++
++static void test_smoothing_keeps_the_ends_and_the_corners_that_matter(void) {
++    S16 x[600], z[600];
++    S32 reached, n, m, i;
++
++    /* open ground: a straight run collapses to its two ends */
++    clear_map(16, 16);
++    n = find(1, 1, 12, 1, x, z, &reached);
++    ASSERT_EQ_INT(12, n);
++    m = TapPath_Smooth(x, z, n);
++    ASSERT_EQ_INT(2, m);
++    ASSERT_EQ_INT(1, x[0]);
++    ASSERT_EQ_INT(12, x[1]);
++
++    /* a wall in the way: a corner survives, and every leg is clear */
++    clear_map(16, 16);
++    for (i = 0; i < 12; i++)
++        g_blocked[i][8] = 1;
++    n = find(4, 5, 12, 5, x, z, &reached);
++    m = TapPath_Smooth(x, z, n);
++    ASSERT_TRUE(m >= 3 && m < n);
++    ASSERT_EQ_INT(4, x[0]);
++    ASSERT_EQ_INT(12, x[m - 1]);
++    for (i = 1; i < m; i++)
++        ASSERT_TRUE(TapPath_LineClear(x[i - 1], z[i - 1], x[i], z[i]));
++}
++
++static void test_unusable_queries_are_refused(void) {
++    S16 x[4], z[4];
++    S32 reached = 5;
++
++    clear_map(8, 8);
++    TapPath_Begin(walkable_cb, NULL, 8, 8);
++    ASSERT_EQ_INT(0, TapPath_Find(-1, 0, 3, 3, x, z, 4, &reached));
++    ASSERT_EQ_INT(0, reached);
++    ASSERT_EQ_INT(0, TapPath_Find(0, 99, 3, 3, x, z, 4, &reached));
++    ASSERT_EQ_INT(0, TapPath_Find(0, 0, 3, 3, x, z, 0, &reached));
++}
++
++/* The sweep. Random grids from empty to 40% solid, 8x8 up to the 64x64 of a whole cube. */
++static unsigned g_seed = 20260622u;
++static int rnd(int n) {
++    g_seed = g_seed * 1664525u + 1013904223u;
++    return (int)((g_seed >> 8) % (unsigned)n);
++}
++
++static void test_routes_match_a_reference_on_random_grids(void) {
++    static int dist[DIM][DIM];
++    S16 x[600], z[600];
++    int iter, bad_route = 0, bad_cost = 0, bad_partial = 0, bad_smooth = 0;
++
++    for (iter = 0; iter < 1500; iter++) {
++        int w = (iter % 4 == 0) ? 64 : 8 + rnd(25);
++        int h = (iter % 4 == 0) ? 64 : 8 + rnd(25);
++        int density = (iter % 11) * 4;
++        int i, j, sx, sz, gx, gz;
++        S32 reached, n, m;
++
++        clear_map(w, h);
++        for (j = 0; j < h; j++)
++            for (i = 0; i < w; i++)
++                g_blocked[j][i] = (rnd(100) < density);
++        sx = rnd(w);
++        sz = rnd(h);
++        gx = rnd(w);
++        gz = rnd(h);
++
++        n = find(sx, sz, gx, gz, x, z, &reached);
++        if (n < 1 || x[0] != sx || z[0] != sz || route_cost(x, z, n) < 0) {
++            bad_route++;
++            continue;
++        }
++
++        dijkstra(sx, sz, dist);
++        if (dist[gz][gx] >= 0 && walk(gx, gz)) {
++            if (!reached || x[n - 1] != gx || z[n - 1] != gz || route_cost(x, z, n) != dist[gz][gx])
++                bad_cost++;
++        } else {
++            int best = 1 << 30;
++            for (j = 0; j < h; j++)
++                for (i = 0; i < w; i++)
++                    if (dist[j][i] >= 0 && octile(i, j, gx, gz) < best)
++                        best = octile(i, j, gx, gz);
++            if (reached || octile(x[n - 1], z[n - 1], gx, gz) != best)
++                bad_partial++;
++        }
++
++        m = TapPath_Smooth(x, z, n);
++        if (m < 1 || m > n || x[0] != sx || z[0] != sz)
++            bad_smooth++;
++        for (i = 1; i < m; i++)
++            if (!TapPath_LineClear(x[i - 1], z[i - 1], x[i], z[i]))
++                bad_smooth++;
++    }
++
++    ASSERT_EQ_INT(0, bad_route);
++    ASSERT_EQ_INT(0, bad_cost);
++    ASSERT_EQ_INT(0, bad_partial);
++    ASSERT_EQ_INT(0, bad_smooth);
++}
++
++int main(void) {
++    RUN_TEST(test_open_ground_route_is_the_cheapest);
++    RUN_TEST(test_a_wall_with_a_gap_is_gone_round);
++    RUN_TEST(test_a_goal_inside_a_wall_ends_at_the_nearest_reachable_cell);
++    RUN_TEST(test_a_goal_walled_in_is_approached_not_entered);
++    RUN_TEST(test_a_diagonal_never_cuts_a_corner);
++    RUN_TEST(test_the_start_cell_is_always_walkable);
++    RUN_TEST(test_a_goal_off_the_grid_is_the_nearest_cell_on_it);
++    RUN_TEST(test_a_route_longer_than_the_room_keeps_its_beginning);
++    RUN_TEST(test_smoothing_keeps_the_ends_and_the_corners_that_matter);
++    RUN_TEST(test_unusable_queries_are_refused);
++    RUN_TEST(test_routes_match_a_reference_on_random_grids);
++    TEST_SUMMARY();
++    return test_failures != 0;
++}
+-- 
+2.43.0
+

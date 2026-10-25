@@ -1,8 +1,12 @@
-# One-off helper for a fork. It builds a branch called tap-to-walk from the exact commit the change was
-# made on (417ea9336b39adaeb10b9a35391966b88e2be43e), lays the changed files from tap-to-walk-files.zip
-# (committed in the repository root) over it, pushes the branch, and starts the project's own
-# "Release Android" workflow on it. Run it once from the Actions tab; the APKs come out of the
+# One-off helper for a fork. It lays the files of tap-to-walk-2fa1c7a.zip (committed in the repository
+# root) over this fork's main on a branch called tap-to-walk, pushes the branch, and starts the project's
+# own "Release Android" workflow on it. Run it once from the Actions tab; the APKs come out of the
 # "Release Android" run it starts, under Artifacts.
+#
+# The files in the zip were made against upstream commit 2fa1c7a. The branch is cut from this fork's
+# main, not from that commit: GitHub refuses a push from a token without the `workflows` permission when
+# the new branch's workflow files differ from the default branch's, and a branch cut from an older commit
+# would differ in any workflow upstream has touched since.
 name: Apply tap to walk and build
 
 on:
@@ -17,7 +21,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      BASE: 417ea9336b39adaeb10b9a35391966b88e2be43e
+      BASE: 2fa1c7a66de2ce8707d85cb9a304dbd6f96c8ab8
+      ZIP: tap-to-walk-2fa1c7a.zip
     steps:
       - name: Check out the fork with its history
         uses: actions/checkout@v6
@@ -27,21 +32,28 @@ jobs:
       - name: Build the tap-to-walk branch
         run: |
           set -euo pipefail
-          test -f tap-to-walk-files.zip || { echo "::error::tap-to-walk-files.zip is not in the repository root"; exit 1; }
-          git cat-file -e "$BASE^{commit}" || { echo "::error::The commit $BASE is not in this fork's history"; exit 1; }
-          cp tap-to-walk-files.zip "$RUNNER_TEMP/files.zip"
+          test -f "$ZIP" || { echo "::error::$ZIP is not in the repository root"; exit 1; }
+          git merge-base --is-ancestor "$BASE" HEAD || { echo "::error::This fork's main does not contain upstream commit $BASE"; exit 1; }
+          cp "$ZIP" "$RUNNER_TEMP/files.zip"
+          unzip -Z1 "$RUNNER_TEMP/files.zip" > "$RUNNER_TEMP/files.txt"
+          # The zip's files replace the fork's own, so those must still be what the change was made against.
+          while read -r f; do
+            if git cat-file -e "$BASE:$f" 2>/dev/null; then
+              git diff --quiet "$BASE" HEAD -- "$f" || { echo "::error::$f has changed in this fork since $BASE"; exit 1; }
+            fi
+          done < "$RUNNER_TEMP/files.txt"
           git config user.name "tap-to-walk"
           git config user.email "tap-to-walk@users.noreply.github.com"
-          git checkout -q -b tap-to-walk "$BASE"
+          git checkout -q -b tap-to-walk
           unzip -q -o "$RUNNER_TEMP/files.zip"
-          git add -A
+          git add --pathspec-from-file="$RUNNER_TEMP/files.txt"
           git status --short
           git commit -q -m "feat(android): tap to walk, with routes round obstacles"
 
       - name: Push the branch
         run: |
           git push --force origin tap-to-walk || {
-            echo "::error::The branch could not be pushed. In your fork: Settings > Actions > General > Workflow permissions > Read and write permissions > Save, then run this workflow again."
+            echo "::error::The branch could not be pushed."
             exit 1
           }
 

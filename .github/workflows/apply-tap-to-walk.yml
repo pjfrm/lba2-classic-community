@@ -1,4 +1,4 @@
-# One-off helper for a fork. It lays the files of tap-to-walk-2fa1c7a.zip (committed in the repository
+# One-off helper for a fork. It lays the files of hold-to-walk-2fa1c7a.zip (committed in the repository
 # root) over this fork's main on a branch called tap-to-walk, pushes the branch, and starts the project's
 # own "Release Android" workflow on it. Run it once from the Actions tab; the APKs come out of the
 # "Release Android" run it starts, under Artifacts.
@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 10
     env:
       BASE: 2fa1c7a66de2ce8707d85cb9a304dbd6f96c8ab8
-      ZIP: tap-to-walk-2fa1c7a.zip
+      ZIP: hold-to-walk-2fa1c7a.zip
     steps:
       - name: Check out the fork with its history
         uses: actions/checkout@v6
@@ -48,7 +48,7 @@ jobs:
           unzip -q -o "$RUNNER_TEMP/files.zip"
           git add --pathspec-from-file="$RUNNER_TEMP/files.txt"
           git status --short
-          git commit -q -m "feat(android): tap to walk, with routes round obstacles"
+          git commit -q -m "feat(android): touch to walk, with routes round obstacles"
 
       - name: Push the branch
         run: |

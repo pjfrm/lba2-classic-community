@@ -24,6 +24,7 @@ extern S32 GfxDitherShading;
 #include "EXIT_SCREEN.H"
 #include "PERFTRACE.H"
 #include "TOUCH_INPUT.H"
+#include "TAPMOVE.H"
 #include <SYSTEM/CUE.H>
 #include <SYSTEM/DISCIMG.H>
 #include <SYSTEM/LOG.H>
@@ -633,6 +634,11 @@ restartloop:
             Input |= Control_InputCurrentMask();
             Control_InputFrameTick();
         }
+
+        // Touch tap-to-walk: OR in the movement keys that steer the hero to the spot the player
+        // touched (TAPMOVE.H). The only place it runs is this loop, so a dialogue or a menu,
+        // which run their own, never see it.
+        Input |= TapMove_Steer();
 
         ManageTime();
 

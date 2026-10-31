@@ -14,6 +14,7 @@
 #include "MOUSE_CAPTURE.H"   /* MouseConfine */
 #include "RES_SWITCH.H"
 #include "RETAILFIX.H"         /* the retail fixes' settings */
+#include "TAPMOVE.H"           /* TouchTapToMove */
 #include <PLATFORM/PLATFORM.H> /* PLATFORM_FILTER_*, and why a mode was refused */
 #include <POLYGON/POLYFILT.H>  /* PolyTexFilter / EnvTexFilter */
 #include <SVGA/SCREEN.H>
@@ -206,8 +207,9 @@ static const T_SETTING MouseSettings[] = {
 };
 #define MOUSE_SETTING_COUNT ((S32)(sizeof(MouseSettings) / sizeof(MouseSettings[0])))
 
-/* The right stick's camera preferences and the stick deadzone. The pad's
- * bindings stay with INPUT.CPP, which writes them straight after these. The
+/* The right stick's camera preferences and the stick deadzone, and the touch
+ * overlay's tap-to-walk switch, which is too small to have a table of its own.
+ * The pad's bindings stay with INPUT.CPP, which writes them straight after these. The
  * deadzone's ceiling is load-bearing too: JOYSTICK.CPP narrows it to S16. */
 static const T_SETTING GamepadSettings[] = {
     {"GamepadDeadzone", NULL, "pad_deadzone", &JoystickDeadzone, SETTING_CLAMP, LBA2_GAMEPAD_DEADZONE_DEFAULT, 0, 32767,
@@ -224,6 +226,8 @@ static const T_SETTING GamepadSettings[] = {
      1, 200, NULL, NULL, NULL, NULL, "Right-stick orbit speed ceiling (units/frame at sens 10)", SETTING_RECORDED, SETTING_BEFORE_NONE},
     {"GamepadCamMaxAlpha", NULL, "cam_stick_max_y", &GamepadCamMaxAlpha, SETTING_CLAMP, GAMEPAD_CAM_ALPHA_MAX_DEFAULT,
      1, 100, NULL, NULL, NULL, NULL, "Right-stick elevation speed ceiling (units/frame at sens 10)", SETTING_RECORDED, SETTING_BEFORE_NONE},
+    {"TouchTapToMove", NULL, "touch_tap_move", &TouchTapToMove, SETTING_TRUTHY, TRUE, 0, 1,
+     NULL, NULL, NULL, NULL, "Touch overlay: tap the screen to walk there (0 = on-screen D-pad)", SETTING_NOT_RECORDED},
 };
 #define GAMEPAD_SETTING_COUNT ((S32)(sizeof(GamepadSettings) / sizeof(GamepadSettings[0])))
 

@@ -6,6 +6,7 @@
 #include "FOLLOWCAM.H" /* FollowCamera: camera zones re-aim the Auto camera */
 #include "RECORD.H"    /* Record_SeedHook: the boot scene load's seed on a replay */
 #include "SAVEGAME.H"
+#include "TAPMOVE.H"   /* TapMove_TurnRate: how fast touch steering turns the hero */
 #include "ZONE_GEOM.H" // ZonePointInBox -- single source of truth for the zone box test
 
 #include <SYSTEM/LOG.H> // cubetrace
@@ -3883,10 +3884,12 @@ findoanim:
 
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void ManualRealAngle(T_OBJET *ptrobj) {
+    /* 1024 is what the turn keys give; touch steering asks for faster (TAPMOVE.H). */
+    const S32 turnRate = TapMove_TurnRate(1024);
     if (Input & I_LEFT)
-        ChangeSpeedMove(&ptrobj->BoundAngle.Move, 1024);
+        ChangeSpeedMove(&ptrobj->BoundAngle.Move, turnRate);
     else if (Input & I_RIGHT)
-        ChangeSpeedMove(&ptrobj->BoundAngle.Move, -1024);
+        ChangeSpeedMove(&ptrobj->BoundAngle.Move, -turnRate);
     else
         ChangeSpeedMove(&ptrobj->BoundAngle.Move, 0);
 

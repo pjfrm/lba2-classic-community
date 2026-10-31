@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 10
     env:
       BASE: 2fa1c7a66de2ce8707d85cb9a304dbd6f96c8ab8
-      ZIP: hold-to-walk-2fa1c7a.zip
+      ZIP: touch-controls-2fa1c7a.zip
     steps:
       - name: Check out the fork with its history
         uses: actions/checkout@v6

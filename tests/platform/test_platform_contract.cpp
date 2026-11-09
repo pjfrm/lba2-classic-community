@@ -15,6 +15,7 @@
 #include <SYSTEM/WINDOW.H>
 
 #include "JOYSTICK.H"
+#include "TAPMOVE.H"
 #include "TOUCH_INPUT.H"
 #include "INPUT_BINDINGS.H"
 
@@ -42,6 +43,26 @@ U32 SizeChar = 8;
 S32 CubeMode = 0;
 S32 GamepadCameraAnalog = 0;
 S32 FollowCamera = 0;
+S32 Language = 0; // English: the overlay draws its labels in Spanish only when this is 3
+
+static S32 s_tapGameplayRunning = 0; // what the overlay is told about the game: is it being played?
+
+// TAPMOVE.CPP is the game side of tap-to-walk and drags the engine in with it. The overlay asks
+// it five things; here the answer is always "not walking, nothing being played", which is the
+// overlay as it was.
+S32 TapMove_GameplayRunning(void) {
+    return s_tapGameplayRunning;
+}
+S32 TapMove_ReplacesDpad(void) {
+    return 0;
+}
+S32 TapMove_Touch(float, float, S32) {
+    return 0;
+}
+void TapMove_Cancel(void) {}
+S32 TapMove_GetMarker(S32 *, S32 *) {
+    return 0;
+}
 }
 
 namespace {
@@ -784,6 +805,137 @@ static void test_touch_wake_hold_release_and_reapply() {
     ASSERT_EQ_INT(0, TouchOverlay_HandleEvent(&touch));
 }
 
+/* Put a finger on (x, y), report whether `key` went down under it, and lift the finger again. */
+static bool TouchPressesKey(float x, float y, U32 key) {
+    PlatformEvent touch = {};
+    touch.type = PLATFORM_EVENT_FINGER_DOWN;
+    touch.tfinger.fingerID = 7;
+    touch.tfinger.x = x;
+    touch.tfinger.y = y;
+    TouchOverlay_HandleEvent(&touch);
+    const bool down = CheckKey(key) != 0;
+    touch.type = PLATFORM_EVENT_FINGER_UP;
+    TouchOverlay_HandleEvent(&touch);
+    return down && !CheckKey(key);
+}
+
+static void test_touch_main_controls_press_their_keys() {
+    ModeDesiredX = ModeResX = 640;
+    ModeDesiredY = ModeResY = 480;
+    ASSERT_TRUE(ResizeWindowSurface(640, 480, false));
+    memset(TabKeys, 0, sizeof(TabKeys));
+    TouchOverlay_Init();
+    LastInputWasTouch = 1; // already playing by touch: the first touch acts, it does not just wake
+
+    // The four controls a player reaches for all the time, each on its own key.
+    ASSERT_TRUE(TouchPressesKey(0.885f, 0.855f, K_SPACE)); // action
+    ASSERT_TRUE(TouchPressesKey(0.675f, 0.875f, K_ENTER)); // use
+    ASSERT_TRUE(TouchPressesKey(0.84f, 0.545f, K_H));      // holomap: there was no button for it at all
+    ASSERT_TRUE(TouchPressesKey(0.84f, 0.675f, K_SHIFT));  // inventory
+
+    // The button is the rectangle that is drawn, corners included: a big button with dead corners is a
+    // button the thumb misses. Action spans x 0.785..0.985, y 0.755..0.955.
+    ASSERT_TRUE(TouchPressesKey(0.79f, 0.76f, K_SPACE));
+    ASSERT_TRUE(TouchPressesKey(0.98f, 0.95f, K_SPACE));
+    // Between Use and Action there is glass, not a button.
+    ASSERT_TRUE(!TouchPressesKey(0.77f, 0.86f, K_SPACE));
+    ASSERT_TRUE(!TouchPressesKey(0.77f, 0.86f, K_ENTER));
+
+    // The old controls are still where a thumb can find them, on the keys they were on.
+    ASSERT_TRUE(TouchPressesKey(0.735f, 0.40f, K_CTRL)); // behaviour menu
+    ASSERT_TRUE(TouchPressesKey(0.85f, 0.40f, K_ALT));   // throw
+    ASSERT_TRUE(TouchPressesKey(0.952f, 0.40f, K_W));    // talk / search
+    TouchOverlay_Shutdown();
+}
+
+static U32 CountOverlayPixels(void) {
+    static U32 frame[640 * 480];
+    U32 drawn = 0;
+    memset(frame, 0, sizeof(frame));
+    TouchOverlay_Render(frame, 640 * sizeof(U32), 640, 480, NULL);
+    for (size_t i = 0; i < 640 * 480; ++i)
+        if (frame[i] != 0)
+            ++drawn;
+    return drawn;
+}
+
+static void test_touch_controls_stay_up_while_the_game_is_played_and_go_in_a_dialogue() {
+    ModeDesiredX = ModeResX = 640;
+    ModeDesiredY = ModeResY = 480;
+    ASSERT_TRUE(ResizeWindowSurface(640, 480, false));
+    memset(TabKeys, 0, sizeof(TabKeys));
+    s_ticks = 100000;
+    TouchOverlay_Init();
+    LastInputWasTouch = 1;
+
+    // A touch on empty glass: the overlay is at full strength.
+    PlatformEvent touch = {};
+    touch.type = PLATFORM_EVENT_FINGER_DOWN;
+    touch.tfinger.fingerID = 3;
+    touch.tfinger.x = 0.5f;
+    touch.tfinger.y = 0.2f;
+    TouchOverlay_HandleEvent(&touch);
+    touch.type = PLATFORM_EVENT_FINGER_UP;
+    TouchOverlay_HandleEvent(&touch);
+    s_tapGameplayRunning = 1;
+    const U32 full = CountOverlayPixels();
+    ASSERT_TRUE(full > 5000);
+
+    // A few seconds on it is recessive but all there: it used to fade to a third and then vanish.
+    s_ticks += 3000;
+    ASSERT_EQ_INT((int)full, (int)CountOverlayPixels());
+
+    // Long idle in the game itself: still there. The player is walking with one finger and reaching for
+    // Action with the other; it must be where it was, not wait to be touched awake.
+    s_ticks += 60000;
+    s_tapGameplayRunning = 1;
+    ASSERT_EQ_INT((int)full, (int)CountOverlayPixels());
+
+    // Long idle in a dialogue, a cutscene or a video: the game is not asking for input, so it goes.
+    s_tapGameplayRunning = 0;
+    ASSERT_EQ_INT(0, (int)CountOverlayPixels());
+    TouchOverlay_Shutdown();
+}
+
+static void test_touch_labels_are_drawn_in_spanish_when_the_game_is_in_spanish() {
+    static U32 english[640 * 480], spanish[640 * 480];
+    size_t differing = 0;
+
+    ModeDesiredX = ModeResX = 640;
+    ModeDesiredY = ModeResY = 480;
+    ASSERT_TRUE(ResizeWindowSurface(640, 480, false));
+    memset(TabKeys, 0, sizeof(TabKeys));
+    s_ticks = 200000;
+    TouchOverlay_Init();
+    LastInputWasTouch = 1;
+    PlatformEvent touch = {};
+    touch.type = PLATFORM_EVENT_FINGER_DOWN;
+    touch.tfinger.fingerID = 3;
+    touch.tfinger.x = 0.5f;
+    touch.tfinger.y = 0.2f;
+    TouchOverlay_HandleEvent(&touch);
+    touch.type = PLATFORM_EVENT_FINGER_UP;
+    TouchOverlay_HandleEvent(&touch);
+
+    memset(english, 0, sizeof(english));
+    memset(spanish, 0, sizeof(spanish));
+    // The fixture's font is empty, so every label would draw nothing: make every glyph a solid block, and
+    // the words differ by how many glyphs they have (USE / USAR) and by the accent on ACCIÓN.
+    memset(Font8x8, 0xFF, sizeof(Font8x8));
+    Language = 0;
+    TouchOverlay_Render(english, 640 * sizeof(U32), 640, 480, NULL);
+    Language = 3;
+    TouchOverlay_Render(spanish, 640 * sizeof(U32), 640, 480, NULL);
+    Language = 0;
+    memset(Font8x8, 0, sizeof(Font8x8));
+
+    for (size_t i = 0; i < 640 * 480; ++i)
+        if (english[i] != spanish[i])
+            ++differing;
+    ASSERT_TRUE(differing > 200); // the words are different; the buttons under them are the same
+    TouchOverlay_Shutdown();
+}
+
 static void test_touch_recenter_scope_pulse_and_bindings() {
     RestoreInput();
     InitInput();
@@ -947,6 +1099,9 @@ int main() {
     RUN_TEST(test_zoom_presents_only_updated_rectangles);
     RUN_TEST(test_partial_present_after_resize);
     RUN_TEST(test_touch_wake_hold_release_and_reapply);
+    RUN_TEST(test_touch_main_controls_press_their_keys);
+    RUN_TEST(test_touch_controls_stay_up_while_the_game_is_played_and_go_in_a_dialogue);
+    RUN_TEST(test_touch_labels_are_drawn_in_spanish_when_the_game_is_in_spanish);
     RUN_TEST(test_touch_recenter_scope_pulse_and_bindings);
     RUN_TEST(test_touch_recenter_between_gameplay_polls);
     EndWindow();

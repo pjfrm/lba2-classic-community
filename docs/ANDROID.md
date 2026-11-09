@@ -297,28 +297,84 @@ The on-screen virtual gamepad uses the following layout:
 ```
 +--(ESC)---------(HIDE)---------(MEN)(CAM)-+
 |                                           |
-|                                           |
-|                                           |
-|                                           |
-|      (U)               (MD) (ACT) (USE)   |
-|   (L) (D) (R)          (THR) (INV) (W)    |
+|                  (MODE)(THROW)(TALK)      |
+|                  [   HOLOMAP    ]         |
+|     (U)          [  INVENTORY   ]         |
+|  (L)(D)(R)    (USE)   [ ACTION ]          |
 +-------------------------------------------+
 ```
 
+The four controls a player reaches for all the time (action, use, holomap, inventory) are big, each in
+its own colour, and spelt out in words, on the right where a thumb rests. The rest are smaller. Labels are
+drawn in Spanish when the game's language is Spanish, and in English otherwise.
+
+- **ACTION** (ACCIÓN) — Action (Space): the action of the current behaviour: jump, fight, hide, talk
+- **USE** (USAR) — Use / confirm (Enter)
+- **HOLOMAP** (HOLOMAPA) — Holomap (H)
+- **INVENTORY** (INVENTARIO) — Inventory (Shift)
+- **MODE** (MODO) — Behaviour menu (Ctrl)
+- **THROW** (LANZAR) — Throw (Alt)
+- **TALK** (HABLAR) — Talk / search (W): works whatever the behaviour
 - **ESC** — Escape (quit/back)
-- **HIDE** — Dismiss the controls now; the next touch brings them back
+- **HIDE** (OCULTAR) — Dismiss the controls now; the next touch brings them back
 - **MEN** — Menu (F10 / in-game menu)
 - **CAM** — Camera toggle (Backspace)
-- **D-pad** — U/D/L/R → Arrow keys (movement)
-- **MD** — Mode (Ctrl / behaviour mode)
-- **ACT** — Action (Space / jump/interact)
-- **USE** — Use/confirm (Enter)
-- **THR** — Throw (Alt)
-- **INV** — Inventory (Shift)
-- **W** — Action (always-on action key, "W" for walk/run)
+- **D-pad** — U/D/L/R → Arrow keys (movement). With [touch to walk](#touch-to-walk) on (the default) it is
+  left out while the game is running; it comes back on the menus, the inventory and the
+  save list, which are driven by direction keys
+
+A button is the rectangle that is drawn, corners included, and goes brighter and more opaque while it is
+pressed, so a thumb can see it has landed.
 
 The layout is defined in `SOURCES/TOUCH_INPUT.CPP` and can be customised
 by editing the `kButtons[]` table (normalised 0..1 coordinates).
+
+
+## Touch to walk
+
+Put a finger on the floor and Twinsen walks to the spot under it. Move the finger and he follows;
+lift it and he stops. A ring on the floor marks where he is heading, and stays up while the finger
+is down, after the buttons have faded. The tank-style D-pad is still there if you prefer it (see the
+setting below).
+
+How it behaves, and why it is built that way, is written up in
+[`TAPMOVE.H`](../SOURCES/TAPMOVE.H). In short:
+
+- **A touch on empty glass is a walk.** A touch that lands on a button is that button's. The first
+  touch after using another device only wakes the overlay, as everywhere else.
+- **It presses the keys a player would.** Each gameplay frame `TapMove_Steer` ORs the up / left /
+  right bits into the input the engine reads, right where the replay harness ORs its own.
+  Animations, speed, collisions, climbing, swimming and the behaviour modes are the engine's
+  existing movement code, untouched.
+- **The finger becomes a spot on the floor through the camera the frame was drawn with**, at the
+  height of the hero's feet: the engine's own world-to-screen projection is inverted, so it holds
+  for the classic isometric rooms and the perspective Auto camera alike.
+- **Interiors route round obstacles.** The route is found on the cube's brick grid (A\*,
+  eight-way moves, no corner cutting, straightened afterwards), so a finger on the far side of a
+  wall walks him round it, and a spot that is walled off is approached as closely as it can be.
+  Islands are not on the brick grid: there he walks straight at the finger.
+- **It stops** when the finger is lifted; on any keyboard or gamepad movement; when the hero leaves
+  manual control (a cutscene, a script, death); and when a dialogue, a menu or the inventory comes
+  up. At the finger he waits for it to move on. Blocked for about half a second, the route is
+  worked out again from where he stands.
+- **It is off during replays and the scripted harness.** A recording already holds the keys this
+  produced; generating them again would drive the hero twice.
+
+The switch is `TouchTapToMove` in `lba2.cfg`, or `touch_tap_move` on the console
+(see [`CONFIG_FILE.CPP`](../SOURCES/CONFIG_FILE.CPP)): `1` (the default) for touch to walk, `0` for
+the on-screen D-pad as before.
+
+Limits worth knowing:
+
+- Routes are planned on the floor the hero is standing on. A spot on another level of a room (up a
+  staircase, on a platform) is found at his own height, not where it appears on screen, and a route
+  does not climb.
+- Things the brick grid does not contain (a character in the way, a block being pushed) are not
+  routed round: he keeps pushing against them, and the route is worked out again every half second.
+- A quick tap is a nudge: he turns towards it and takes a step before the lift stops him. Hold the
+  finger to walk.
+- It has not been exercised on every scene: if a route goes somewhere odd, the D-pad setting is the
+  way out, and the scene is worth reporting.
 
 ## When the overlay shows
 
@@ -328,8 +384,9 @@ stop using it:
 | state | overlay |
 |-------|---------|
 | a finger is down | full opacity, for as long as it is held |
-| ~1.5s after the lift | dimmed, still legible enough to aim by |
-| ~6s after the lift | gone |
+| ~1.5s after the lift | recessive: about two thirds strength, the words on the buttons still sharp |
+| ~6s after the lift, the game being played | still there, recessive: a player walking with one finger reaches for Action with the other, and it must be where it was |
+| ~6s after the lift, in a dialogue, a cutscene or a video | gone |
 | a gamepad or key was the last input | gone, until a finger says otherwise |
 | nothing has been touched yet | dimmed, or gone if a pad is connected or the device is a TV |
 | HIDE was pressed | gone now, without waiting out the fade |
